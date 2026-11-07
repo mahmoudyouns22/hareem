@@ -142,7 +142,8 @@ class App {
     eq(problems, [], 'no errors, native dialogs or outside requests');
   }
 }
-async function phone({ engine = 'chromium', device = 'Pixel 7', viewport, now = NOW, colorScheme = 'light', base = BASE, ...rest } = {}) {
+// E2E_ENGINE=webkit runs the default phone on the iPhone engine
+async function phone({ engine = process.env.E2E_ENGINE || 'chromium', device = engine === 'webkit' ? 'iPhone 14' : 'Pixel 7', viewport, now = NOW, colorScheme = 'light', base = BASE, ...rest } = {}) {
   const browser = await getBrowser(engine);
   const d = { ...devices[device] };
   const ctx = await browser.newContext({ ...d, ...(viewport ? { viewport } : {}), locale: 'ar-IQ', timezoneId: 'Asia/Baghdad', colorScheme, acceptDownloads: true, ...rest });
@@ -801,11 +802,13 @@ async function suite() {
     await a.p.waitForSelector('.nav a');
     eq(await a.js(() => [lang, db.settings.shopName, document.documentElement.dataset.theme, document.documentElement.lang]), ['ku', 'هەرێم', 'dark', 'ckb'], 'all kept after restart');
     await a.tab('home');
+    await a.p.waitForFunction(() => route.name === 'home');
     eq(await a.text('.tb-title h1'), 'هەرێم', 'name in header');
     await a.page('settings');
     await a.p.fill('#shop-name', '');
     await a.p.press('#shop-name', 'Enter');
     await a.tab('home');
+    await a.p.waitForFunction(() => route.name === 'home');
     eq(await a.text('.tb-title h1'), 'هریم', 'empty name falls back to هريم');
     await a.p.tap('[data-act="toggle-lang"]');
     eq(await a.text('.tb-title h1'), 'هريم', 'arabic form');
@@ -918,10 +921,11 @@ async function suite() {
     await a.p.tap(`${DIALOG} .dialog-actions [data-no]`);
     await a.p.waitForTimeout(350);
     eq(await a.js(() => db.rentals.length), 0, 'cancel keeps current data');
+    await a.clearToast();
     await feed(put('good2.txt', text));
     await a.dialogOpen();
     await a.p.tap(`${DIALOG} [data-yes]`);
-    await a.p.waitForSelector('#toast.show');
+    eq(await a.toast(), T.restore_done, 'restore finished');
     await a.p.waitForFunction(() => db.rentals.length === 6);
     const same = await a.js((orig) => { const o = JSON.parse(orig).data; return ['equipment', 'customers', 'rentals', 'repairs', 'ledger'].every((k) => JSON.stringify(db[k]) === JSON.stringify(o[k])); }, text);
     ok(same, 'restored data identical to the backup');
@@ -1176,8 +1180,10 @@ async function suite() {
     await a.p.tap('[data-search="customers"]');
     await a.p.setViewportSize({ width: 412, height: 480 }); // what Android's keyboard does to the layout
     await a.p.waitForTimeout(100);
-    eq(await a.p.isVisible('.nav'), false, 'bar hidden with keyboard');
-    eq(await a.p.isVisible('.fab'), false, 'add button hidden with keyboard');
+    if (await a.js(() => navigator.maxTouchPoints > 0)) {
+      eq(await a.p.isVisible('.nav'), false, 'bar hidden with keyboard');
+      eq(await a.p.isVisible('.fab'), false, 'add button hidden with keyboard');
+    }
     await a.p.setViewportSize({ width: 412, height: 839 });
     await a.p.waitForTimeout(100);
     eq(await a.p.isVisible('.nav'), true, 'bar back when the keyboard closes, even with the field still focused');
@@ -1555,7 +1561,7 @@ async function suite() {
     await a.addEquipment('خلاطة', 2, 10000);
     await a.tab('rentals');
     await a.fab();
-    await a.newCustomer('زبون', '0770');
+    await a.newCustomer('زبون التجربة', '0770');
     await a.pickEquipment(0, 'خلاطة', 2);
     await a.set('start', '2026-11-04');
     await a.set('advance', 5000);
@@ -1568,9 +1574,19 @@ async function suite() {
     await a.save();
     await a.tab('repairs');
     await a.fab();
-    await a.pickCustomer('زبون');
+    await a.pickCustomer('زبون', 'زبون التجربة');
+    eq(await a.p.isVisible(`${SHEET} .combo-new`), false, 'existing customer: no new-customer field');
     await a.set('device', 'دريل');
     await a.save();
+    eq(await a.js(() => db.customers.length), 1, 'picking from the list creates no second customer');
+    // the "new customer" row works by touch too
+    await a.fab();
+    await a.set('customerName', 'زبون آخر');
+    await a.p.tap(`${SHEET} .combo-add`);
+    await a.p.waitForTimeout(350);
+    eq(await a.js(() => [document.activeElement.name, document.querySelector('.ov-sheet:not(.closing) .combo-new').hidden]), ['customerPhone', false], 'moves to the phone field');
+    await a.js(() => closeAll());
+    await a.closed();
     await a.p.tap('#list [data-act="ready"]');
     await a.p.tap('[data-act="seg"][data-val="ready"]');
     await a.p.tap('#list [data-act="deliver"]');

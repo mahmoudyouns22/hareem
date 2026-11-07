@@ -2,7 +2,7 @@
    Vanilla JS, no build step. All data stays on the phone (IndexedDB). */
 'use strict';
 
-const VERSION = '1.0.1';
+const VERSION = '1.0.2';
 
 /* ================= helpers ================= */
 const $ = (s, r = document) => r.querySelector(s);
@@ -605,8 +605,8 @@ function bindCustomerField(form, onChange, debtorsFirst = false) {
   };
   inp.addEventListener('input', () => { sync(); show(); });
   inp.addEventListener('focus', show);
-  inp.addEventListener('blur', () => setTimeout(() => { list.hidden = true; inp.setAttribute('aria-expanded', 'false'); }, 120));
-  list.addEventListener('pointerdown', (e) => e.preventDefault()); // keep focus in the input while choosing
+  inp.addEventListener('blur', () => setTimeout(() => { list.hidden = true; inp.setAttribute('aria-expanded', 'false'); }, 250));
+  list.addEventListener('mousedown', (e) => e.preventDefault()); // keep focus in the input while choosing
   list.addEventListener('click', (e) => {
     const o = e.target.closest('.combo-opt');
     if (!o) return;
