@@ -2,7 +2,7 @@
    Vanilla JS, no build step. All data stays on the phone (IndexedDB). */
 'use strict';
 
-const VERSION = '1.0.2';
+const VERSION = '1.0.3';
 
 /* ================= helpers ================= */
 const $ = (s, r = document) => r.querySelector(s);
@@ -46,7 +46,7 @@ function compact(n) {
   if (n >= 1e3) return `${Math.round(n / 1e3)} ${t('thousand')}`;
   return String(Math.round(n));
 }
-const byName = (a, b) => a.name.localeCompare(b.name, lang === 'ku' ? 'ckb' : 'ar');
+const byName = (a, b) => (a.name || '').localeCompare(b.name || '', lang === 'ku' ? 'ckb' : 'ar');
 
 /* dates are stored as local "YYYY-MM-DD" strings */
 const pad = (n) => String(n).padStart(2, '0');
@@ -88,6 +88,7 @@ const ICONS = {
   trash: '<path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/>',
   edit: '<path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/>',
   package: '<path d="m7.5 4.27 9 5.15"/><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/>',
+  camera: '<path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/>',
   chart: '<path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/>',
   settings: '<path d="M20 7h-9"/><path d="M14 17H5"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/>',
   cloud: '<path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="M12 12v9"/><path d="m16 16-4-4-4 4"/>',
@@ -113,6 +114,48 @@ function avatar(name, size = '') {
   let h = 0;
   for (const c of s) h = (h * 31 + c.codePointAt(0)) >>> 0;
   return `<span class="avatar ${size} av-${h % 6}" aria-hidden="true">${esc([...s][0] || '?')}</span>`;
+}
+
+// a product's picture, or the package icon when it has none
+const eqThumb = (photo, size = '') => (photo
+  ? `<img class="thumb ${size}" src="${esc(photo)}" alt="">`
+  : `<span class="hist-ic rent thumb ${size}">${icon('package')}</span>`);
+function miniThumbs(r) {
+  const photos = r.items.map(itemPhoto).filter(Boolean).slice(0, 6);
+  return photos.length ? `<div class="mini-thumbs">${photos.map((p) => `<img src="${esc(p)}" alt="">`).join('')}</div>` : '';
+}
+// Pictures are shrunk before saving, so hundreds of them still fit in the phone's storage and in one backup file.
+const PHOTO_MAX = 480;
+async function photoToDataUrl(file) {
+  let source, width, height, release;
+  try {
+    source = await createImageBitmap(file);
+    width = source.width;
+    height = source.height;
+    release = () => source.close();
+  } catch (err) {
+    const url = URL.createObjectURL(file);
+    release = () => URL.revokeObjectURL(url);
+    source = await new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => { release(); reject(new Error('not an image')); };
+      img.src = url;
+    });
+    width = source.naturalWidth;
+    height = source.naturalHeight;
+  }
+  const scale = Math.min(1, PHOTO_MAX / Math.max(width, height));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(width * scale));
+  canvas.height = Math.max(1, Math.round(height * scale));
+  const g = canvas.getContext('2d');
+  g.fillStyle = '#fff'; // transparent pictures get a white background in JPEG
+  g.fillRect(0, 0, canvas.width, canvas.height);
+  g.imageSmoothingQuality = 'high';
+  g.drawImage(source, 0, 0, canvas.width, canvas.height);
+  release();
+  return canvas.toDataURL('image/jpeg', 0.72);
 }
 
 /* ================= storage (IndexedDB, localStorage fallback) ================= */
@@ -258,7 +301,10 @@ function commit(msg) {
 
 /* ================= domain ================= */
 const custName = (id) => byId(db.customers, id)?.name || '—';
-const itemName = (it) => byId(db.equipment, it.equipmentId)?.name || it.name || '—';
+const itemName = (it) => byId(db.equipment, it.equipmentId)?.name || it.name || t('no_name');
+const itemPhoto = (it) => byId(db.equipment, it.equipmentId)?.photo || '';
+const eqName = (e) => e.name || t('no_name');
+const devName = (p) => p.device || t('no_name');
 const isOpen = (r) => !r.returnDate;
 const dailyOf = (r) => r.items.reduce((s, it) => s + it.qty * it.rate, 0);
 const accrued = (r) => dailyOf(r) * rentDays(r.start, today());
@@ -328,7 +374,7 @@ function topEquipment(R) {
     if (isOpen(r) || !inRange(r.returnDate, R)) continue;
     const base = dailyOf(r) || 1;
     for (const it of r.items) {
-      const cur = m.get(it.equipmentId) || { name: itemName(it), v: 0 };
+      const cur = m.get(it.equipmentId) || { name: itemName(it), photo: itemPhoto(it), v: 0 };
       cur.v += ((r.total || 0) * it.qty * it.rate) / base; // share of a discounted total
       m.set(it.equipmentId, cur);
     }
@@ -449,9 +495,9 @@ window.addEventListener('popstate', () => {
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && overlays.length && !locked) requestClose(); });
 
 const formState = (form) => JSON.stringify([...new FormData(form).entries()]);
-function sheet({ title, body, foot = '', onMount, onClose }) {
+function sheet({ title, body, foot = '', cls = '', onMount, onClose }) {
   const wrap = document.createElement('div');
-  wrap.className = 'ov ov-sheet';
+  wrap.className = `ov ov-sheet ${cls}`;
   wrap.innerHTML = `<div class="scrim" data-close></div>
     <form class="sheet" novalidate autocomplete="off" role="dialog" aria-modal="true" aria-label="${esc(title)}">
       <header class="sheet-head"><h2>${esc(title)}</h2><button type="button" class="icon-btn" data-close aria-label="${t('close')}">${icon('x')}</button></header>
@@ -561,7 +607,7 @@ function showErr(form, key, msg) {
 function customerField(cid) {
   const c = cid ? byId(db.customers, cid) : null;
   return `<div class="field combo">
-    <label for="f-cname">${t('customer')}</label>
+    <label for="f-cname">${t('customer')}${optLabel()}</label>
     <div class="combo-box">
       <span class="combo-ic">${icon('user')}</span>
       <input class="input" id="f-cname" name="customerName" value="${esc(c?.name || '')}" placeholder="${t('customer_ph')}" autocomplete="off" enterkeyhint="next" maxlength="60" role="combobox" aria-expanded="false" aria-autocomplete="list">
@@ -572,7 +618,6 @@ function customerField(cid) {
       <label class="label" for="f-cphone">${t('new_customer_phone')}${optLabel()}</label>
       <input class="input ltr-input" id="f-cphone" name="customerPhone" type="tel" inputmode="tel" placeholder="07xx xxx xxxx" maxlength="20">
     </div>
-    <div class="err" data-err="customer" hidden></div>
   </div>`;
 }
 function bindCustomerField(form, onChange, debtorsFirst = false) {
@@ -622,9 +667,11 @@ function resolveCustomer(form) {
   const name = form.elements.customerName.value.trim();
   const id = form.elements.customerId.value;
   if (id && byId(db.customers, id)) return id;
-  const match = db.customers.find((c) => norm(c.name) === norm(name));
+  // no name given: such records share one "unnamed customer" account, so any debt stays visible
+  const unnamed = [window.I18N.ar.unnamed_customer, window.I18N.ku.unnamed_customer].map(norm);
+  const match = name ? db.customers.find((c) => norm(c.name) === norm(name)) : db.customers.find((c) => unnamed.includes(norm(c.name)));
   if (match) return match.id;
-  const c = { id: uid(), name, phone: latinDigits(form.elements.customerPhone?.value || '').trim(), note: '', createdAt: Date.now() };
+  const c = { id: uid(), name: name || t('unnamed_customer'), phone: latinDigits(form.elements.customerPhone?.value || '').trim(), note: '', createdAt: Date.now() };
   db.customers.push(c);
   return c.id;
 }
@@ -638,7 +685,7 @@ function rentalCard(r, inCustomer = false) {
     return `<article class="card rc">${hit}${lead}
       <div class="rc-main">
         <div class="rc-title"><span>${esc(name)}</span></div>
-        <div class="rc-sub">${itemsText(r)}</div>
+        <div class="rc-sub">${itemsText(r)}</div>${miniThumbs(r)}
         <div class="rc-meta"><span>${icon('calendar')}${fmtDate(r.start)}</span><span>${icon('clock')}${L().since(daysBetween(r.start, today()))}</span></div>
       </div>
       <div class="rc-end"><span class="rc-amount">${money(accrued(r))}</span>
@@ -649,7 +696,7 @@ function rentalCard(r, inCustomer = false) {
   return `<article class="card rc">${hit}${lead}
     <div class="rc-main">
       <div class="rc-title"><span>${esc(name)}</span></div>
-      <div class="rc-sub">${itemsText(r)}</div>
+      <div class="rc-sub">${itemsText(r)}</div>${miniThumbs(r)}
       <div class="rc-meta"><span>${icon('calendar')}${fmtDate(r.start)} ← ${fmtDate(r.returnDate)}</span><span>${icon('clock')}${L().days(r.days)}</span></div>
     </div>
     <div class="rc-end"><span class="rc-amount">${money(r.total)}</span>
@@ -669,10 +716,10 @@ function repairCard(p, inCustomer = false) {
       : `<span class="chip ${(p.price || 0) < (p.parts || 0) ? 'chip-bad' : 'chip-good'}">${t('profit')} ${moneyText((p.price || 0) - (p.parts || 0))}</span>`}`;
   }
   const delivered = p.status === 'delivered';
-  return `<article class="card rc"><button class="rc-hit" data-act="repair" data-id="${p.id}" aria-label="${esc(p.device)}"></button>
+  return `<article class="card rc"><button class="rc-hit" data-act="repair" data-id="${p.id}" aria-label="${esc(devName(p))}"></button>
     <span class="hist-ic">${icon('wrench')}</span>
     <div class="rc-main">
-      <div class="rc-title"><span>${esc(p.device)}</span></div>
+      <div class="rc-title"><span>${esc(devName(p))}</span></div>
       ${name || p.problem ? `<div class="rc-sub">${[name, p.problem].filter(Boolean).map(esc).join(' · ')}</div>` : ''}
       <div class="rc-meta"><span>${icon('calendar')}${fmtDate(delivered ? p.dateOut : p.dateIn)}</span>${delivered ? '' : `<span>${icon('clock')}${L().since(daysBetween(p.dateIn, today()))}</span>`}</div>
     </div>
@@ -693,10 +740,10 @@ function customerCard(c, b) {
 function equipmentCard(e) {
   const out = rentedQty(e.id);
   const pct = e.total ? Math.min(100, Math.round((out / e.total) * 100)) : 0;
-  return `<article class="card rc"><button class="rc-hit" data-act="equipment" data-id="${e.id}" aria-label="${esc(e.name)}"></button>
-    <span class="hist-ic rent">${icon('package')}</span>
+  return `<article class="card rc"><button class="rc-hit" data-act="equipment" data-id="${e.id}" aria-label="${esc(eqName(e))}"></button>
+    ${eqThumb(e.photo, 'lg')}
     <div class="rc-main">
-      <div class="rc-title"><span>${esc(e.name)}</span></div>
+      <div class="rc-title"><span>${esc(eqName(e))}</span></div>
       <div class="rc-meta"><span>${t('available_of', { a: e.total - out, t: e.total })}</span>${out ? `<span class="chip chip-brand">${t('rented_out', { n: out })}</span>` : ''}</div>
       <div class="meter" aria-hidden="true"><i style="width:${pct}%"></i></div>
     </div>
@@ -857,8 +904,8 @@ function pageEquipment() {
 function listEquipment() {
   const q = db.equipment.length > 5 ? norm(ui.q.equipment || '') : '';
   let rows = db.equipment.slice().sort(byName);
-  if (q) rows = rows.filter((e) => norm(e.name).includes(q));
-  if (rows.length) return rows.map(equipmentCard).join('');
+  if (q) rows = rows.filter((e) => norm(eqName(e)).includes(q));
+  if (rows.length) return paged('equipment', rows, (e) => equipmentCard(e));
   return q ? emptyInline(t('no_results')) : emptyState('package', t('no_equipment'), t('need_equipment'));
 }
 
@@ -927,7 +974,7 @@ function pageReports() {
       <div class="card stat" style="grid-column:1/-1"><span class="stat-k">${t('cash_in')}</span><span class="stat-v">${money(s.cash)}</span><span class="stat-s">${t('cash_hint')}</span></div>
     </div>
     <div class="sec"><h2>${t('top_equipment')}</h2></div>
-    ${top.length ? `<section class="card rank">${top.map((x) => `<div class="rank-row"><div class="rank-top"><b>${esc(x.name)}</b><span>${money(x.v)}</span></div>
+    ${top.length ? `<section class="card rank">${top.map((x) => `<div class="rank-row"><div class="rank-top">${x.photo ? `<img class="rank-thumb" src="${esc(x.photo)}" alt="">` : ''}<b>${esc(x.name)}</b><span>${money(x.v)}</span></div>
       <div class="rank-bar"><i style="width:${Math.max(2, (x.v / topMax) * 100)}%"></i></div></div>`).join('')}</section>` : emptyInline(t('no_data'))}`;
   return { title: t('reports'), back: true, html };
 }
@@ -1070,17 +1117,18 @@ function fitNumbers() {
 }
 
 /* ================= sheets: rentals ================= */
-function itemRow(it, exceptRentalId) {
-  // equipment deleted since this rental: keep it selectable so editing an old rental can't lose the line
-  const gone = it.equipmentId && !byId(db.equipment, it.equipmentId)
-    ? `<option value="${esc(it.equipmentId)}" data-rate="${it.rate}" data-avail="${it.qty}" data-name="${esc(it.name)}" selected>${esc(it.name)}</option>` : '';
-  const opts = gone + db.equipment.slice().sort(byName).map((e) => {
-    const avail = e.total - rentedQty(e.id, exceptRentalId);
-    const sel = e.id === it.equipmentId;
-    return `<option value="${e.id}" data-rate="${e.rate}" data-avail="${avail}" data-name="${esc(e.name)}"${sel ? ' selected' : ''}${avail <= 0 && !sel ? ' disabled' : ''}>${esc(e.name)} · ${t('available_n', { n: avail })}</option>`;
-  }).join('');
-  return `<div class="item-row" data-row>
-    <div class="ir-top"><select class="input" name="eq" aria-label="${t('choose_equipment')}"><option value="">${t('choose_equipment')}</option>${opts}</select>
+const pickFace = (name, photo, avail) => `${photo ? eqThumb(photo) : `<span class="hist-ic thumb">${icon('package')}</span>`}
+  <span class="ep-main"><span class="ep-name">${esc(name)}</span>${avail == null ? '' : `<span class="ep-sub">${t('available_n', { n: avail })}</span>`}</span>${icon('chevron-down', 'chev')}`;
+function itemRow(it, exceptRentalId, showAvail = true) {
+  // equipment deleted since this rental keeps its saved name, so editing an old rental can't lose the line
+  const e = byId(db.equipment, it.equipmentId);
+  const avail = e ? e.total - rentedQty(e.id, exceptRentalId) : (it.qty || 0);
+  const face = it.equipmentId
+    ? pickFace(e ? eqName(e) : (it.name || t('no_name')), e?.photo, showAvail ? avail : null)
+    : pickFace(t('choose_equipment'), '', null);
+  return `<div class="item-row" data-row data-avail="${avail}" data-name="${esc(e ? e.name : it.name || '')}">
+    <input type="hidden" name="eq" value="${esc(it.equipmentId || '')}">
+    <div class="ir-top"><button type="button" class="eq-pick" data-pick-eq aria-label="${t('choose_equipment')}">${face}</button>
       <button type="button" class="icon-btn" data-del-row aria-label="${t('delete')}">${icon('trash')}</button></div>
     <div class="ir-bottom">
       <div class="stepper"><button type="button" data-step="-1" aria-label="−">${icon('minus')}</button><input name="qty" inputmode="numeric" data-int value="${it.qty || 1}" aria-label="${t('qty')}"><button type="button" data-step="1" aria-label="+">${icon('plus')}</button></div>
@@ -1088,6 +1136,34 @@ function itemRow(it, exceptRentalId) {
     </div>
     <div class="ir-foot"><span class="ir-avail"></span><span class="ir-line"></span></div>
   </div>`;
+}
+// a list with pictures: a phone's native dropdown can't show them, and some products have only a picture
+function equipmentPicker(exceptRentalId, onPick) {
+  const rows = db.equipment.slice().sort(byName);
+  const option = (e) => {
+    const avail = e.total - rentedQty(e.id, exceptRentalId);
+    return `<button type="button" class="eq-opt" data-id="${e.id}" data-name="${esc(e.name)}"${avail <= 0 ? ' disabled' : ''}>${eqThumb(e.photo, 'lg')}
+      <span class="ep-main"><span class="ep-name">${esc(eqName(e))}</span><span class="ep-sub">${t('available_n', { n: avail })}${e.rate ? ` · ${moneyText(e.rate)} ${t('per_day')}` : ''}</span></span></button>`;
+  };
+  sheet({
+    title: t('choose_equipment'),
+    cls: 'ov-picker',
+    body: `${rows.length > 6 ? `<div class="search">${icon('search')}<input class="input" type="search" placeholder="${t('search')}" aria-label="${t('search')}"></div>` : ''}
+      <div class="eq-opts">${rows.map(option).join('')}</div>`,
+    onMount(form) {
+      const search = $('input[type=search]', form);
+      search?.addEventListener('input', () => {
+        const q = norm(search.value);
+        $$('.eq-opt', form).forEach((b) => { b.hidden = !!q && !norm(b.textContent).includes(q); });
+      });
+      form.addEventListener('click', async (e) => {
+        const b = e.target.closest('.eq-opt');
+        if (!b || b.disabled) return;
+        await closeOverlay();
+        onPick(b.dataset.id);
+      });
+    },
+  });
 }
 
 function rentalForm(id) {
@@ -1097,7 +1173,7 @@ function rentalForm(id) {
   const items = r ? r.items : [{ equipmentId: '', qty: 1, rate: 0 }];
   const body = `${customerField(r?.customerId)}
     <div class="field"><span class="label">${t('items_label')}</span>
-      <div class="items" id="items">${items.map((it) => itemRow(it, r?.id)).join('')}</div>
+      <div class="items" id="items">${items.map((it) => itemRow(it, r?.id, !closed)).join('')}</div>
       <button type="button" class="add-row" data-add-row>${icon('plus')}${t('add_item')}</button>
       <div class="err" data-err="items" hidden></div>
     </div>
@@ -1119,11 +1195,10 @@ function rentalForm(id) {
         let sum = 0;
         const rows = $$('[data-row]', itemsEl);
         for (const row of rows) {
-          const opt = row.querySelector('select').selectedOptions[0];
-          const chosen = !!opt?.value;
+          const chosen = !!row.querySelector('[name=eq]').value;
           const qty = Math.max(1, toInt(row.querySelector('[name=qty]').value));
           const rate = toInt(row.querySelector('[name=rate]').value);
-          const avail = chosen ? +opt.dataset.avail : 0;
+          const avail = +row.dataset.avail;
           row.querySelector('.ir-avail').innerHTML = chosen && !closed && qty > avail ? `<span class="bad">${t('available_n', { n: avail })}</span>` : '';
           row.querySelector('.ir-line').textContent = chosen ? `${moneyText(qty * rate)} ${t('per_day')}` : '';
           if (chosen) sum += qty * rate;
@@ -1131,17 +1206,26 @@ function rentalForm(id) {
         $('#daily-sum', form).innerHTML = money(sum);
         rows.forEach((row) => { row.querySelector('[data-del-row]').hidden = rows.length < 2; });
       };
-      itemsEl.addEventListener('change', (e) => {
-        if (!e.target.matches('select')) return;
-        const opt = e.target.selectedOptions[0];
-        if (opt?.value) e.target.closest('[data-row]').querySelector('[name=rate]').value = num(+opt.dataset.rate);
+      const openPicker = (row) => equipmentPicker(r?.id, (eqId) => {
+        const e = byId(db.equipment, eqId);
+        const avail = e.total - rentedQty(eqId, r?.id);
+        row.querySelector('[name=eq]').value = eqId;
+        row.dataset.avail = avail;
+        row.dataset.name = e.name;
+        row.querySelector('.eq-pick').innerHTML = pickFace(eqName(e), e.photo, closed ? null : avail);
+        row.querySelector('[name=rate]').value = e.rate ? num(e.rate) : '';
         recalc();
       });
-      itemsEl.addEventListener('click', (e) => { const del = e.target.closest('[data-del-row]'); if (del) { del.closest('[data-row]').remove(); recalc(); } });
+      itemsEl.addEventListener('click', (e) => {
+        const del = e.target.closest('[data-del-row]');
+        if (del) { del.closest('[data-row]').remove(); recalc(); return; }
+        const pick = e.target.closest('[data-pick-eq]');
+        if (pick) openPicker(pick.closest('[data-row]'));
+      });
       $('[data-add-row]', form).addEventListener('click', () => {
         itemsEl.insertAdjacentHTML('beforeend', itemRow({ equipmentId: '', qty: 1, rate: 0 }, r?.id));
         recalc();
-        itemsEl.lastElementChild.querySelector('select').focus();
+        openPicker(itemsEl.lastElementChild);
       });
       form.addEventListener('input', recalc);
       onSubmit(form, () => saveRental(form, r));
@@ -1152,19 +1236,13 @@ function rentalForm(id) {
 async function saveRental(form, r) {
   clearErrs(form);
   const f = form.elements;
-  if (!f.customerName.value.trim()) return showErr(form, 'customer', t('err_customer'));
-  const items = $$('[data-row]', form).map((row) => {
-    const opt = row.querySelector('select').selectedOptions[0];
-    return {
-      equipmentId: opt?.value || '',
-      name: opt?.dataset.name || '',
-      qty: Math.max(1, toInt(row.querySelector('[name=qty]').value)),
-      rate: toInt(row.querySelector('[name=rate]').value),
-    };
-  }).filter((x) => x.equipmentId);
+  const items = $$('[data-row]', form).map((row) => ({
+    equipmentId: row.querySelector('[name=eq]').value,
+    name: row.dataset.name || '',
+    qty: Math.max(1, toInt(row.querySelector('[name=qty]').value)),
+    rate: toInt(row.querySelector('[name=rate]').value),
+  })).filter((x) => x.equipmentId);
   if (!items.length) return showErr(form, 'items', t('err_items'));
-  const noRate = items.find((x) => x.rate <= 0);
-  if (noRate) return showErr(form, 'items', t('err_rate', { name: noRate.name }));
   if (!r || isOpen(r)) {
     const need = new Map();
     for (const x of items) need.set(x.equipmentId, (need.get(x.equipmentId) || 0) + x.qty);
@@ -1172,7 +1250,7 @@ async function saveRental(form, r) {
       const e = byId(db.equipment, eqId);
       if (!e) continue;
       const avail = e.total - rentedQty(eqId, r?.id);
-      if (q > avail) return showErr(form, 'items', t('err_qty', { name: e.name, n: avail }));
+      if (q > avail) return showErr(form, 'items', t('err_qty', { name: eqName(e), n: avail }));
     }
   }
   const start = f.start.value || today();
@@ -1195,18 +1273,29 @@ function returnForm(id) {
   const r = byId(db.rentals, id);
   if (!r || !isOpen(r)) return;
   const name = custName(r.customerId);
-  const daily = dailyOf(r), adv = r.advance || 0;
+  const daily0 = dailyOf(r), adv = r.advance || 0;
   const d0 = rentDays(r.start, today());
-  const body = `<div class="detail-head">${avatar(name)}<div class="dh-main"><div class="dh-title">${esc(name)}</div><div class="dh-sub">${itemsText(r)}</div></div></div>
+  // more than one piece out: choose how many come back now, the rest stays open on this rental
+  const canSplit = r.items.reduce((sum, it) => sum + it.qty, 0) > 1;
+  const rows = canSplit ? `<div class="field"><span class="label">${t('returned_qty')}</span>
+      <div class="return-items">${r.items.map((it, i) => `<div class="return-row">
+        ${itemPhoto(it) ? eqThumb(itemPhoto(it)) : ''}<div class="rr-main"><div class="rr-name">${esc(itemName(it))}</div><div class="hint">${t('out_of', { n: it.qty })} · ${moneyText(it.rate)} ${t('per_day')}</div></div>
+        <div class="stepper"><button type="button" data-step="-1" aria-label="−">${icon('minus')}</button><input name="ret${i}" inputmode="numeric" data-int data-min="0" data-max="${it.qty}" value="${it.qty}" aria-label="${esc(itemName(it))}"><button type="button" data-step="1" aria-label="+">${icon('plus')}</button></div>
+      </div>`).join('')}</div>
+      <div class="err" data-err="ret" hidden></div>
+      <div class="info-line" id="stays" hidden></div>
+    </div>` : '';
+  const body = `<div class="detail-head">${avatar(name)}<div class="dh-main"><div class="dh-title">${esc(name)}</div>${canSplit ? '' : `<div class="dh-sub">${itemsText(r)}</div>${miniThumbs(r)}`}</div></div>
+    ${rows}
     <div class="row2">
       <div class="field"><label for="f-rd">${t('return_date')}</label><input class="input" type="date" id="f-rd" name="returnDate" value="${today()}" min="${r.start}"></div>
-      <div class="field"><label for="f-days">${t('days_count')}</label><div class="stepper"><button type="button" data-step="-1" aria-label="−">${icon('minus')}</button><input id="f-days" name="days" inputmode="numeric" data-int value="${d0}"><button type="button" data-step="1" aria-label="+">${icon('plus')}</button></div></div>
+      <div class="field"><label for="f-days">${t('days_count')}</label><div class="stepper days-stepper"><button type="button" data-step="-1" aria-label="−">${icon('minus')}</button><input id="f-days" name="days" inputmode="numeric" data-int value="${d0}"><button type="button" data-step="1" aria-label="+">${icon('plus')}</button></div></div>
     </div>
     <div class="err" data-err="dates" hidden style="margin:-8px 0 12px"></div>
-    <div class="field"><label for="m-total">${t('rent_total')}</label>${moneyInput('total', daily * d0, { id: 'm-total' })}
-      <span class="hint">${moneyText(daily)} ${t('per_day')} · ${t('discount_hint')}</span></div>
-    ${adv ? `<div class="summary"><div class="sum-row"><span>${t('advance')}</span><span>${money(adv)}</span></div></div>` : ''}
-    <div class="field"><label for="m-paid">${t('pays_now')}</label>${moneyInput('paid', Math.max(0, daily * d0 - adv), { id: 'm-paid' })}
+    <div class="field"><label for="m-total">${t('rent_total')}</label>${moneyInput('total', daily0 * d0, { id: 'm-total' })}
+      <span class="hint" id="daily-hint"></span></div>
+    <div class="summary" id="adv-box" hidden></div>
+    <div class="field"><label for="m-paid">${t('pays_now')}</label>${moneyInput('paid', Math.max(0, daily0 * d0 - adv), { id: 'm-paid' })}
       <div class="quick-fill"><button type="button" data-fill="full">${t('pay_full')}</button><button type="button" data-fill="none">${t('pay_none')}</button></div></div>`;
   sheet({
     title: t('return_title'),
@@ -1215,39 +1304,75 @@ function returnForm(id) {
     onMount(form) {
       const f = form.elements;
       let totalTouched = false, paidTouched = false;
+      const pieces = () => r.items.map((it, i) => (canSplit ? Math.min(it.qty, Math.max(0, toInt(f[`ret${i}`].value))) : it.qty));
+      const isPartial = (q) => q.some((n, i) => n < r.items[i].qty);
+      // the advance pays this part first and what is left of it stays for the rest; a full return hands back any excess
+      const advanceUsed = (q, total) => (isPartial(q) ? Math.min(adv, total) : adv);
       const update = (src) => {
         if (src === 'returnDate' && f.returnDate.value) f.days.value = rentDays(r.start, f.returnDate.value);
-        if (src === 'returnDate' || src === 'days') totalTouched = false;
+        if (src === 'returnDate' || src === 'days' || /^ret\d/.test(src || '')) totalTouched = false;
+        const q = pieces();
+        const partial = isPartial(q);
+        const daily = q.reduce((sum, n, i) => sum + n * r.items[i].rate, 0);
         const days = Math.max(1, toInt(f.days.value));
         if (!totalTouched) f.total.value = num(daily * days);
         const total = toInt(f.total.value);
-        if (!paidTouched) f.paid.value = num(Math.max(0, total - adv));
-        const rem = total - adv - toInt(f.paid.value);
+        const used = advanceUsed(q, total);
+        if (!paidTouched) f.paid.value = num(Math.max(0, total - used));
+        const rem = total - used - toInt(f.paid.value);
+        $('#daily-hint', form).textContent = `${moneyText(daily)} ${t('per_day')} · ${t('discount_hint')}`;
+        const advBox = $('#adv-box', form);
+        advBox.hidden = !adv;
+        advBox.innerHTML = `<div class="sum-row"><span>${t('advance')}</span><span>${money(used)}</span></div>${
+          adv > used ? `<div class="sum-row"><span>${t('advance_left')}</span><span>${money(adv - used)}</span></div>` : ''}`;
+        const stays = $('#stays', form);
+        if (stays) {
+          stays.hidden = !partial;
+          stays.innerHTML = partial ? `${icon('package')}<span><b>${t('stays_with')}:</b> ${r.items.map((it, i) => [it, it.qty - q[i]]).filter(([, n]) => n > 0).map(([it, n]) => `${esc(itemName(it))} ×${n}`).join(' · ')}</span>` : '';
+        }
         $('#result', form).innerHTML = rem > 0 ? resultBox('bad', 'alert', t('to_debt'), rem)
           : rem < 0 ? resultBox('info', 'info', t('refund'), -rem) : resultBox('good', 'check', t('settled'));
       };
       form.addEventListener('input', (e) => {
-        if (e.target.name === 'total') totalTouched = true;
-        if (e.target.name === 'paid') paidTouched = true;
-        update(e.target.name);
+        const el = e.target;
+        if (el.name === 'total') totalTouched = true;
+        if (el.name === 'paid') paidTouched = true;
+        if (/^ret\d/.test(el.name) && el.value !== '') el.value = String(Math.min(+el.dataset.max, toInt(el.value)));
+        update(el.name);
       });
       form.addEventListener('click', (e) => {
         const b = e.target.closest('[data-fill]');
         if (!b) return;
         paidTouched = true;
-        f.paid.value = b.dataset.fill === 'full' ? num(Math.max(0, toInt(f.total.value) - adv)) : '';
+        const total = toInt(f.total.value);
+        f.paid.value = b.dataset.fill === 'full' ? num(Math.max(0, total - advanceUsed(pieces(), total))) : '';
         update('paid');
       });
       onSubmit(form, async () => {
         clearErrs(form);
+        const q = pieces();
+        if (!q.some((n) => n > 0)) return showErr(form, 'ret', t('err_return_none'));
         const returnDate = f.returnDate.value || today();
         if (returnDate < r.start) return showErr(form, 'dates', t('err_dates'));
         const total = toInt(f.total.value), paid = toInt(f.paid.value);
-        const rem = total - adv - paid;
+        const partial = isPartial(q);
+        const used = advanceUsed(q, total);
+        const rem = total - used - paid;
         // overpayment is handed back, so it never shows up as credit
-        Object.assign(r, { returnDate, days: Math.max(1, toInt(f.days.value)), total, paidAtReturn: rem < 0 ? paid + rem : paid, updatedAt: Date.now() });
+        const closing = { returnDate, days: Math.max(1, toInt(f.days.value)), total, paidAtReturn: rem < 0 ? paid + rem : paid, updatedAt: Date.now() };
+        if (partial) {
+          db.rentals.push({
+            id: uid(), customerId: r.customerId, start: r.start, advance: used, note: r.note, createdAt: Date.now(), ...closing,
+            items: r.items.map((it, i) => ({ ...it, qty: q[i] })).filter((it) => it.qty > 0),
+          });
+          r.items = r.items.map((it, i) => ({ ...it, qty: it.qty - q[i] })).filter((it) => it.qty > 0);
+          r.advance = adv - used;
+          r.updatedAt = Date.now();
+        } else {
+          Object.assign(r, closing);
+        }
         await closeOverlay();
-        commit(t('returned_ok'));
+        commit(partial ? t('returned_part_ok') : t('returned_ok'));
       });
       update();
     },
@@ -1262,7 +1387,7 @@ function rentalDetail(id) {
   const body = `<div class="detail-head">${avatar(name)}<div class="dh-main"><div class="dh-title">${esc(name)}</div>
       <button type="button" class="link-btn" data-go-customer="${r.customerId}">${t('customer_account')}</button></div>
       ${open ? `<span class="chip chip-brand">${t('status_open')}</span>` : `<span class="chip">${t('status_returned')}</span>`}</div>
-    <div class="line-items">${r.items.map((i) => `<div class="line-item"><span class="li-name">${esc(itemName(i))}</span><span class="li-rate">${moneyText(i.rate)} ${t('per_day')}</span><span class="li-qty">×${i.qty}</span></div>`).join('')}</div>
+    <div class="line-items">${r.items.map((i) => `<div class="line-item">${itemPhoto(i) ? eqThumb(itemPhoto(i)) : ''}<span class="li-name">${esc(itemName(i))}</span><span class="li-rate">${moneyText(i.rate)} ${t('per_day')}</span><span class="li-qty">×${i.qty}</span></div>`).join('')}</div>
     <div class="kv">
       ${row(t('start_date'), fmtDate(r.start, true))}
       ${open ? row(t('days_count'), L().days(rentDays(r.start, today()))) : row(t('return_date'), fmtDate(r.returnDate, true)) + row(t('days_count'), L().days(r.days))}
@@ -1299,7 +1424,7 @@ function repairForm(id) {
   const p = id ? byId(db.repairs, id) : null;
   const delivered = p?.status === 'delivered';
   const body = `${customerField(p?.customerId)}
-    <div class="field"><label for="f-dev">${t('device')}</label><input class="input" id="f-dev" name="device" value="${esc(p?.device || '')}" placeholder="${t('device_ph')}" maxlength="60"><div class="err" data-err="device" hidden></div></div>
+    <div class="field"><label for="f-dev">${t('device')}${optLabel()}</label><input class="input" id="f-dev" name="device" value="${esc(p?.device || '')}" placeholder="${t('device_ph')}" maxlength="60"><div class="err" data-err="device" hidden></div></div>
     <div class="field"><label for="f-prob">${t('problem')}${optLabel()}</label><textarea class="input" id="f-prob" name="problem" rows="2" placeholder="${t('problem_ph')}">${esc(p?.problem || '')}</textarea></div>
     <div class="field"><label for="f-din">${t('date_in')}</label><input class="input" type="date" id="f-din" name="dateIn" value="${p?.dateIn || today()}"></div>
     ${delivered ? `<div class="field"><label for="f-dout">${t('date_out')}</label><input class="input" type="date" id="f-dout" name="dateOut" value="${p.dateOut}"><div class="err" data-err="dateOut" hidden></div></div>` : ''}
@@ -1324,8 +1449,7 @@ function repairForm(id) {
       form.addEventListener('input', recalc);
       onSubmit(form, async () => {
         clearErrs(form);
-        if (!f.customerName.value.trim()) return showErr(form, 'customer', t('err_customer'));
-        if (!f.device.value.trim()) return showErr(form, 'device', t('err_device'));
+        if (![f.customerName.value, f.device.value, f.problem.value, f.price.value, f.note.value].some((v) => v.trim())) return showErr(form, 'device', t('err_empty'));
         const dateIn = f.dateIn.value || today();
         if (delivered && (f.dateOut.value || p.dateOut) < dateIn) return showErr(form, 'dateOut', t('err_repair_dates'));
         const fields = {
@@ -1354,7 +1478,7 @@ function repairDetail(id) {
   const due = repairDue(p), profit = (p.price || 0) - (p.parts || 0);
   const chip = { pending: `<span class="chip chip-info">${t('st_pending')}</span>`, ready: `<span class="chip chip-warn">${t('st_ready')}</span>`, delivered: `<span class="chip chip-good">${t('st_delivered')}</span>` }[p.status];
   const row = (k, v, cls = '') => `<div><span class="k">${k}</span><span class="v ${cls}">${v}</span></div>`;
-  const body = `<div class="detail-head"><span class="hist-ic">${icon('wrench')}</span><div class="dh-main"><div class="dh-title">${esc(p.device)}</div>
+  const body = `<div class="detail-head"><span class="hist-ic">${icon('wrench')}</span><div class="dh-main"><div class="dh-title">${esc(devName(p))}</div>
       <button type="button" class="link-btn" data-go-customer="${p.customerId}">${esc(name)}</button></div>${chip}</div>
     ${delivered ? '' : `<div class="btn-row" style="margin-bottom:14px">${p.status === 'pending' ? `<button type="button" class="btn btn-ghost" data-ready>${icon('check')}${t('mark_ready')}</button>` : ''}<button type="button" class="btn btn-primary" data-deliver>${t('deliver')}</button></div>`}
     <div class="kv">
@@ -1399,8 +1523,8 @@ function deliverForm(id) {
   const p = byId(db.repairs, id);
   if (!p || p.status === 'delivered') return;
   const name = custName(p.customerId);
-  const body = `<div class="detail-head"><span class="hist-ic">${icon('wrench')}</span><div class="dh-main"><div class="dh-title">${esc(p.device)}</div><div class="dh-sub">${esc(name)}</div></div></div>
-    <div class="field"><label for="m-price">${t('price')}</label>${moneyInput('price', p.price, { id: 'm-price' })}<div class="err" data-err="price" hidden></div></div>
+  const body = `<div class="detail-head"><span class="hist-ic">${icon('wrench')}</span><div class="dh-main"><div class="dh-title">${esc(devName(p))}</div><div class="dh-sub">${esc(name)}</div></div></div>
+    <div class="field"><label for="m-price">${t('price')}${optLabel()}</label>${moneyInput('price', p.price, { id: 'm-price' })}</div>
     <div class="field"><label for="m-parts">${t('parts_cost')}${optLabel()}</label>${moneyInput('parts', p.parts, { id: 'm-parts' })}</div>
     <div class="summary"><div class="sum-row big"><span>${t('profit')}</span><span id="profit">${money(0)}</span></div></div>
     <div class="field"><label for="f-dout">${t('date_out')}</label><input class="input" type="date" id="f-dout" name="dateOut" value="${today()}" min="${p.dateIn}"><div class="err" data-err="dateOut" hidden></div></div>
@@ -1432,7 +1556,6 @@ function deliverForm(id) {
       });
       onSubmit(form, async () => {
         clearErrs(form);
-        if (!latinDigits(f.price.value).replace(/\D/g, '')) return showErr(form, 'price', t('err_price'));
         const dateOut = f.dateOut.value || today();
         if (dateOut < p.dateIn) return showErr(form, 'dateOut', t('err_repair_dates'));
         const price = toInt(f.price.value);
@@ -1501,7 +1624,6 @@ function ledgerForm(type, { cid, id } = {}) {
       });
       onSubmit(form, async () => {
         clearErrs(form);
-        if (!f.customerName.value.trim()) return showErr(form, 'customer', t('err_customer'));
         const amount = toInt(f.amount.value);
         if (amount <= 0) return showErr(form, 'amount', t('err_amount'));
         const fields = { customerId: resolveCustomer(form), amount, date: f.date.value || today(), note: f.note.value.trim(), updatedAt: Date.now() };
@@ -1517,7 +1639,7 @@ function ledgerForm(type, { cid, id } = {}) {
 /* ================= sheets: customers & equipment ================= */
 function customerForm(id) {
   const c = id ? byId(db.customers, id) : null;
-  const body = `<div class="field"><label for="f-name">${t('name')}</label><input class="input" id="f-name" name="name" value="${esc(c?.name || '')}" maxlength="60" autocomplete="off"><div class="err" data-err="name" hidden></div></div>
+  const body = `<div class="field"><label for="f-name">${t('name')}${optLabel()}</label><input class="input" id="f-name" name="name" value="${esc(c?.name || '')}" maxlength="60" autocomplete="off"><div class="err" data-err="name" hidden></div></div>
     <div class="field"><label for="f-phone">${t('phone')}${optLabel()}</label><input class="input ltr-input" id="f-phone" name="phone" type="tel" inputmode="tel" value="${esc(c?.phone || '')}" placeholder="07xx xxx xxxx" maxlength="20"></div>
     <div class="field"><label for="f-note">${t('note')}${optLabel()}</label><textarea class="input" id="f-note" name="note" rows="2" placeholder="${t('note_ph')}">${esc(c?.note || '')}</textarea></div>`;
   sheet({
@@ -1539,10 +1661,11 @@ function customerForm(id) {
       });
       onSubmit(form, async () => {
         clearErrs(form);
-        const name = f.name.value.trim();
-        if (!name) return showErr(form, 'name', t('err_name'));
+        const phone = latinDigits(f.phone.value).trim();
+        const name = f.name.value.trim() || phone;
+        if (!name) return showErr(form, 'name', t('err_empty'));
         if (db.customers.some((x) => x.id !== c?.id && norm(x.name) === norm(name))) return showErr(form, 'name', t('customer_exists'));
-        const fields = { name, phone: latinDigits(f.phone.value).trim(), note: f.note.value.trim(), updatedAt: Date.now() };
+        const fields = { name, phone, note: f.note.value.trim(), updatedAt: Date.now() };
         if (c) Object.assign(c, fields);
         else db.customers.push({ id: uid(), ...fields, createdAt: Date.now() });
         await closeOverlay();
@@ -1555,13 +1678,15 @@ function customerForm(id) {
 function equipmentForm(id) {
   const e = id ? byId(db.equipment, id) : null;
   const out = e ? rentedQty(e.id) : 0;
-  const body = `<div class="field"><label for="f-name">${t('equipment_name')}</label><input class="input" id="f-name" name="name" value="${esc(e?.name || '')}" placeholder="${t('equipment_name_ph')}" maxlength="60" autocomplete="off"><div class="err" data-err="name" hidden></div></div>
+  const body = `<div class="field"><span class="label">${t('photo')}${optLabel()}</span>
+      <input type="hidden" name="photo"><input type="file" id="photo-file" accept="image/*" hidden>
+      <div id="photo-box"></div><div class="err" data-err="photo" hidden></div></div>
+    <div class="field"><label for="f-name">${t('equipment_name')}${optLabel()}</label><input class="input" id="f-name" name="name" value="${esc(e?.name || '')}" placeholder="${t('equipment_name_ph')}" maxlength="60" autocomplete="off"><div class="err" data-err="name" hidden></div></div>
     <div class="row2">
       <div class="field"><label for="f-total">${t('total_qty')}</label><div class="stepper"><button type="button" data-step="-1" aria-label="−">${icon('minus')}</button><input id="f-total" name="total" inputmode="numeric" data-int value="${e?.total || 1}"><button type="button" data-step="1" aria-label="+">${icon('plus')}</button></div></div>
-      <div class="field"><label for="m-rate">${t('daily_rate')}</label>${moneyInput('rate', e?.rate, { id: 'm-rate' })}</div>
+      <div class="field"><label for="m-rate">${t('daily_rate')}${optLabel()}</label>${moneyInput('rate', e?.rate, { id: 'm-rate' })}</div>
     </div>
     <div class="err" data-err="total" hidden style="margin:-8px 0 12px"></div>
-    <div class="err" data-err="rate" hidden style="margin:-8px 0 12px"></div>
     ${out ? `<div class="summary"><div class="sum-row"><span>${t('rented_out', { n: out })}</span></div></div>` : ''}
     <div class="field"><label for="f-note">${t('note')}${optLabel()}</label><textarea class="input" id="f-note" name="note" rows="2" placeholder="${t('note_ph')}">${esc(e?.note || '')}</textarea></div>`;
   sheet({
@@ -1571,7 +1696,27 @@ function equipmentForm(id) {
       <button type="submit" class="btn btn-primary grow">${icon('check')}${t('save')}</button>`,
     onMount(form) {
       const f = form.elements;
+      const box = $('#photo-box', form), file = $('#photo-file', form);
+      const drawPhoto = () => {
+        box.innerHTML = f.photo.value
+          ? `<div class="photo-set"><img class="photo-preview" src="${esc(f.photo.value)}" alt="">
+              <div class="photo-actions"><button type="button" class="btn btn-sm btn-ghost" data-photo-pick>${icon('camera')}${t('photo_change')}</button>
+              <button type="button" class="btn btn-sm btn-danger" data-photo-del>${icon('trash')}${t('photo_remove')}</button></div></div>`
+          : `<button type="button" class="photo-add" data-photo-pick>${icon('camera')}<span>${t('photo_add')}</span></button>`;
+      };
+      let photoJob = Promise.resolve();
+      file.addEventListener('change', () => {
+        const picked = file.files[0];
+        if (!picked) return;
+        $('[data-err="photo"]', form).hidden = true;
+        photoJob = photoToDataUrl(picked)
+          .then((data) => { f.photo.value = data; drawPhoto(); })
+          .catch(() => showErr(form, 'photo', t('photo_bad')));
+        file.value = '';
+      });
       form.addEventListener('click', async (ev) => {
+        if (ev.target.closest('[data-photo-pick]')) { file.click(); return; } // inside the tap: phones only open the picker from one
+        if (ev.target.closest('[data-photo-del]')) { f.photo.value = ''; drawPhoto(); return; }
         if (!ev.target.closest('[data-del]')) return;
         if (out) { await confirmBox({ title: t('delete'), message: t('equipment_in_use'), ok: t('close') }); return; }
         if (!(await confirmDelete())) return;
@@ -1580,19 +1725,20 @@ function equipmentForm(id) {
         commit(t('deleted'));
       });
       onSubmit(form, async () => {
+        await photoJob;
         clearErrs(form);
         const name = f.name.value.trim();
-        if (!name) return showErr(form, 'name', t('err_name'));
+        if (!name && !f.photo.value) return showErr(form, 'name', t('err_eq_empty'));
         const total = Math.max(1, toInt(f.total.value));
         if (total < out) return showErr(form, 'total', t('err_total_lt_rented', { n: out }));
-        const rate = toInt(f.rate.value);
-        if (rate <= 0) return showErr(form, 'rate', t('err_eq_rate'));
-        const fields = { name, total, rate, note: f.note.value.trim(), updatedAt: Date.now() };
+        const fields = { name, total, rate: toInt(f.rate.value), photo: f.photo.value, note: f.note.value.trim(), updatedAt: Date.now() };
         if (e) Object.assign(e, fields);
         else db.equipment.push({ id: uid(), ...fields, createdAt: Date.now() });
         await closeOverlay();
         commit(t('saved'));
       });
+      f.photo.value = e?.photo || '';
+      drawPhoto();
     },
   });
 }
@@ -1924,7 +2070,9 @@ document.addEventListener('click', (e) => {
   const step = e.target.closest('[data-step]');
   if (step) {
     const inp = step.parentElement.querySelector('input');
-    inp.value = Math.max(1, toInt(inp.value) + Number(step.dataset.step));
+    const min = inp.dataset.min === undefined ? 1 : +inp.dataset.min;
+    const max = inp.dataset.max === undefined ? Infinity : +inp.dataset.max;
+    inp.value = Math.min(max, Math.max(min, toInt(inp.value) + Number(step.dataset.step)));
     inp.dispatchEvent(new Event('input', { bubbles: true }));
     return;
   }

@@ -125,11 +125,18 @@ class App {
   }
   async pickEquipment(i, name, qty, rate) {
     const row = `${SHEET} [data-row]:nth-child(${i + 1})`;
-    const value = await this.p.$eval(`${row} select`, (s, n) => [...s.options].find((o) => o.dataset.name === n)?.value, name);
-    ok(value, `equipment option exists: ${name}`);
-    await this.p.selectOption(`${row} select`, value);
+    if (!(await this.p.$('.ov-picker:not(.closing)'))) await this.p.tap(`${row} [data-pick-eq]`); // "add" opens the list by itself
+    await this.p.waitForSelector('.ov-picker:not(.closing) .eq-opt');
+    await this.p.waitForTimeout(340);
+    await this.p.tap(`.ov-picker:not(.closing) .eq-opt[data-name="${name}"]`);
+    await this.p.waitForFunction(() => !document.querySelector('.ov-picker:not(.closing)'));
+    await this.p.waitForTimeout(40);
     if (qty != null) await this.p.fill(`${row} [name=qty]`, String(qty));
     if (rate != null) await this.p.fill(`${row} [name=rate]`, String(rate));
+  }
+  async choosePhoto(file) {
+    const [fc] = await Promise.all([this.p.waitForEvent('filechooser'), this.p.tap(`${SHEET} [data-photo-pick]`)]);
+    await fc.setFiles(file);
   }
   async addEquipment(name, total, rate) {
     await this.fab();
@@ -228,10 +235,8 @@ async function suite() {
     has(await a.text('#list'), T.no_equipment, 'empty state');
     await a.fab();
     await a.submit();
-    eq(await a.err('name'), T.err_name, 'name required');
+    eq(await a.err('name'), T.err_eq_empty, 'needs at least a name or a picture');
     await a.set('name', 'خلاطة كونكريت');
-    await a.submit();
-    eq(await a.err('rate'), T.err_eq_rate, 'rate required');
     await a.p.tap(`${SHEET} [name=rate]`);
     await a.p.keyboard.type('٢٥٠٠٠'); // Arabic-Indic digits from a phone keyboard
     eq(await a.val('rate'), '25,000', 'Arabic digits converted and grouped');
@@ -282,8 +287,6 @@ async function suite() {
     await a.addEquipment('مولدة', 1, 35000);
     await a.tab('rentals');
     await a.fab();
-    await a.submit();
-    eq(await a.err('customer'), T.err_customer, 'customer required');
     await a.newCustomer('أحمد الجبوري', '٠٧٧٠ ١٢٣ ٤٥٦٧');
     await a.submit();
     eq(await a.err('items'), T.err_items, 'equipment required');
@@ -293,10 +296,6 @@ async function suite() {
     await a.submit();
     eq(await a.err('items'), T.err_qty.replace('{name}', 'سقالة').replace('{n}', '40'), 'over quantity blocked');
     await a.p.fill(`${SHEET} [data-row]:nth-child(1) [name=qty]`, '20');
-    await a.p.fill(`${SHEET} [data-row]:nth-child(1) [name=rate]`, '');
-    await a.submit();
-    eq(await a.err('items'), T.err_rate.replace('{name}', 'سقالة'), 'rate required on a line');
-    await a.p.fill(`${SHEET} [data-row]:nth-child(1) [name=rate]`, '1500');
     await a.p.tap(`${SHEET} [data-add-row]`);
     await a.pickEquipment(1, 'سقالة', 21);
     await a.submit();
@@ -339,8 +338,10 @@ async function suite() {
     await a.pickEquipment(0, 'مولدة');
     await a.save();
     await a.fab();
-    const opts = await a.p.$$eval(`${SHEET} [data-row] select option`, (os) => os.map((o) => [o.textContent, o.disabled]));
-    eq(opts.slice(1), [['خلاطة · المتوفر: 2', false], ['سقالة · المتوفر: 20', false], ['مولدة · المتوفر: 0', true]], 'options');
+    await a.p.tap(`${SHEET} [data-pick-eq]`);
+    await a.p.waitForSelector('.ov-picker:not(.closing) .eq-opt');
+    const opts = await a.p.$$eval('.ov-picker:not(.closing) .eq-opt', (os) => os.map((o) => [o.dataset.name, o.querySelector('.ep-sub').innerText.split('·')[0].trim(), o.disabled]));
+    eq(opts, [['خلاطة', 'المتوفر: 2', false], ['سقالة', 'المتوفر: 20', false], ['مولدة', 'المتوفر: 0', true]], 'options');
     await a.js(() => closeAll());
     await a.closed();
     // editing an open rental doesn't count its own quantity against itself
@@ -382,7 +383,7 @@ async function suite() {
     // date drives days and the total
     await a.set('returnDate', '2026-11-12');
     eq([await a.val('days'), await a.val('total')], ['10', '550,000'], 'later return date');
-    await a.p.tap(`${SHEET} [data-step="-1"]`);
+    await a.p.tap(`${SHEET} .days-stepper [data-step="-1"]`);
     eq([await a.val('days'), await a.val('total')], ['9', '495,000'], 'days stepper');
     await a.set('total', 250000);
     eq(await a.val('days'), '9', 'discount leaves the days');
@@ -422,6 +423,474 @@ async function suite() {
     await a.done();
   });
 
+  await test('partial return: split, advance, debt, stock, reports all add up', async () => {
+    const a = await phone();
+    await a.start();
+    const T = await a.T();
+    const c = (n) => `${n} ${T.currency}`;
+    await a.js(() => {
+      db.equipment = [{ id: 'e1', name: 'خلاطة', total: 3, rate: 25000 }, { id: 'e2', name: 'سقالة', total: 40, rate: 1500 }];
+      db.customers = [{ id: 'c1', name: 'أحمد', phone: '', note: '' }];
+      db.rentals = [
+        { id: 'r1', customerId: 'c1', items: [{ equipmentId: 'e2', name: 'سقالة', qty: 20, rate: 1500 }, { equipmentId: 'e1', name: 'خلاطة', qty: 1, rate: 25000 }], start: '2026-11-02', advance: 20000, note: 'موقع', returnDate: null },
+        { id: 'r2', customerId: 'c1', items: [{ equipmentId: 'e2', name: 'سقالة', qty: 10, rate: 1500 }], start: '2026-11-06', advance: 100000, note: '', returnDate: null },
+        { id: 'r3', customerId: 'c1', items: [{ equipmentId: 'e1', name: 'خلاطة', qty: 1, rate: 25000 }], start: '2026-11-06', advance: 0, note: '', returnDate: null },
+      ];
+      commit();
+    });
+    const openReturn = async (id) => { await a.js((x) => returnForm(x), id); await a.sheetOpen(); };
+    // one single piece: nothing to choose
+    await openReturn('r3');
+    eq(await a.p.$$eval(`${SHEET} .return-row`, (x) => x.length), 0, 'no quantity choice for a single piece');
+    has(await a.text(`${SHEET} .dh-sub`), 'خلاطة ×1', 'single item named in the header');
+    await a.js(() => closeAll());
+    await a.closed();
+    // starts as a full return, so the usual case stays one tap
+    await openReturn('r1');
+    eq(await a.p.$$eval(`${SHEET} .return-row`, (x) => x.length), 2, 'one row per item');
+    eq([await a.val('ret0'), await a.val('ret1'), await a.val('days'), await a.val('total'), await a.val('paid')], ['20', '1', '5', '275,000', '255,000'], 'defaults to everything');
+    eq(await a.p.isVisible(`${SHEET} #stays`), false, 'nothing stays yet');
+    // part of it comes back
+    await a.set('ret0', 8);
+    await a.set('ret1', 0);
+    eq([await a.val('total'), await a.val('paid')], ['60,000', '40,000'], '8 x 1,500 x 5, minus the advance');
+    has(await a.text(`${SHEET} #daily-hint`), c('12,000'), 'daily price of this part');
+    const stays = await a.text(`${SHEET} #stays`);
+    has(stays, T.stays_with, 'label'); has(stays, 'سقالة ×12', 'scaffolds staying'); has(stays, 'خلاطة ×1', 'mixer staying');
+    eq(await a.text(`${SHEET} #result`), T.settled, 'covered by advance and payment');
+    await a.set('paid', 30000);
+    eq(await a.text(`${SHEET} #result`), `${T.to_debt} ${c('10,000')}`, 'rest becomes debt');
+    // limits
+    await a.set('ret0', 99);
+    eq([await a.val('ret0'), await a.val('total')], ['20', '150,000'], 'typing more than he has is capped');
+    await a.p.tap(`${SHEET} .return-row:nth-child(2) [data-step="1"]`);
+    await a.p.tap(`${SHEET} .return-row:nth-child(2) [data-step="1"]`);
+    eq(await a.val('ret1'), '1', 'stepper stops at what he has');
+    await a.p.tap(`${SHEET} .return-row:nth-child(2) [data-step="-1"]`);
+    await a.p.tap(`${SHEET} .return-row:nth-child(2) [data-step="-1"]`);
+    eq(await a.val('ret1'), '0', 'stepper stops at zero');
+    await a.set('ret0', '٨'); // Arabic digit
+    eq(await a.val('ret0'), '8', 'digits from any keyboard');
+    await a.set('ret0', 0);
+    await a.submit();
+    eq(await a.err('ret'), T.err_return_none, 'must return something');
+    await a.set('ret0', '');
+    await a.submit();
+    eq(await a.err('ret'), T.err_return_none, 'empty counts as nothing');
+    eq(await a.js(() => db.rentals.length), 3, 'nothing saved yet');
+    await a.set('ret0', 8);
+    // changing the date still recalculates this part only
+    await a.set('returnDate', '2026-11-12');
+    eq([await a.val('days'), await a.val('total')], ['10', '120,000'], 'date applies to the part');
+    await a.set('returnDate', '2026-11-07');
+    await a.save();
+    eq(await a.toast(), T.returned_part_ok, 'toast says part');
+    const after = await a.js(() => {
+      const open = db.rentals.find((r) => r.id === 'r1');
+      const part = db.rentals.find((r) => !['r1', 'r2', 'r3'].includes(r.id));
+      return {
+        open: [open.items.map((i) => [i.equipmentId, i.qty, i.rate]), open.advance, open.returnDate, open.start, accrued(open)],
+        part: [part.items.map((i) => [i.equipmentId, i.name, i.qty, i.rate]), part.advance, part.total, part.paidAtReturn, part.days, part.returnDate, part.start, part.customerId, part.note, rentalDue(part)],
+        bal: balances().get('c1'),
+        out: [rentedQty('e1'), rentedQty('e2')],
+      };
+    });
+    eq(after.open, [[['e2', 12, 1500], ['e1', 1, 25000]], 0, null, '2026-11-02', 215000], 'the rest stays open from the same date');
+    eq(after.part, [[['e2', 'سقالة', 8, 1500]], 20000, 60000, 30000, 5, '2026-11-07', '2026-11-02', 'c1', 'موقع', 10000], 'returned part closed');
+    eq(after.bal, 10000, 'only the unpaid part is debt');
+    eq(after.out, [2, 22], 'stock: mixers r1+r3, scaffolds 12+10');
+    // screens agree
+    await a.tab('rentals');
+    const openCards = await a.texts('#list .rc');
+    ok(openCards.some((x) => x.includes('سقالة ×12 · خلاطة ×1') && x.includes(c('215,000'))), 'open card shows what is left');
+    await a.p.tap('[data-act="seg"][data-val="closed"]');
+    const closedCard = await a.text('#list .rc');
+    for (const piece of ['سقالة ×8', c('60,000'), `${T.debt} ${c('10,000')}`]) has(closedCard, piece, 'closed card');
+    await a.page('equipment');
+    has((await a.texts('#list .rc')).find((x) => x.startsWith('سقالة')), 'متوفر 18 من 40', 'scaffolds back in stock');
+    // advance bigger than the part: it stays for the rest, nothing is refunded yet
+    await openReturn('r2');
+    await a.set('ret0', 2);
+    eq([await a.val('days'), await a.val('total'), await a.val('paid')], ['1', '3,000', '0'], 'covered by the advance');
+    const adv = await a.text(`${SHEET} #adv-box`);
+    has(adv, c('3,000'), 'advance used'); has(adv, T.advance_left, 'label'); has(adv, c('97,000'), 'advance left');
+    eq(await a.text(`${SHEET} #result`), T.settled, 'settled');
+    await a.save();
+    eq(await a.js(() => { const o = db.rentals.find((r) => r.id === 'r2'); return [o.items[0].qty, o.advance, balances().get('c1')]; }), [8, 97000, 10000], 'advance carried over, debt unchanged');
+    // returning the rest: now the excess really goes back
+    await openReturn('r2');
+    eq([await a.val('ret0'), await a.val('total'), await a.val('paid')], ['8', '12,000', '0'], 'rest of it');
+    eq(await a.text(`${SHEET} #result`), `${T.refund} ${c('85,000')}`, 'refund of the excess');
+    await a.save();
+    eq(await a.toast(), T.returned_ok, 'full return toast');
+    eq(await a.js(() => { const o = db.rentals.find((x) => x.id === 'r2'); return [o.returnDate, o.paidAtReturn, rentalDue(o), balances().get('c1')]; }), ['2026-11-07', -85000, 0, 10000], 'closed with a refund');
+    // finish r1 with one more partial, then the last piece
+    await openReturn('r1');
+    await a.set('ret0', 12);
+    await a.set('ret1', 0);
+    eq(await a.val('total'), '90,000', '12 x 1,500 x 5');
+    await a.save();
+    eq(await a.js(() => db.rentals.find((r) => r.id === 'r1').items.map((i) => [i.equipmentId, i.qty])), [['e1', 1]], 'finished item removed from the open rental');
+    await openReturn('r1');
+    eq(await a.p.$$eval(`${SHEET} .return-row`, (x) => x.length), 0, 'one piece left: no choice needed');
+    eq(await a.val('total'), '125,000', '1 x 25,000 x 5');
+    await a.save();
+    // the books balance: rent earned = cash received + debt still owed
+    const books = await a.js(() => {
+      const s = stats(null);
+      return { rent: s.rent, cash: s.cash, debt: balances().get('c1'), open: db.rentals.filter(isOpen).map((r) => r.id), out: [rentedQty('e1'), rentedQty('e2')], n: s.rentN };
+    });
+    eq(books.open, ['r3'], 'only the untouched rental is still open');
+    eq(books.out, [1, 0], 'stock all back but r3');
+    eq(books.n, 5, 'five closed records');
+    eq(books.rent, 60000 + 3000 + 12000 + 90000 + 125000, 'rent earned');
+    eq(books.cash + books.debt, books.rent, 'cash + debt = rent earned');
+    // unsaved quantity is protected, and everything survives a restart
+    await openReturn('r3');
+    await a.js(() => closeAll());
+    await a.closed();
+    await a.p.reload();
+    await a.p.waitForSelector('.nav a');
+    eq(await a.js(() => [db.rentals.length, balances().get('c1')]), [6, books.debt], 'kept after restart');
+    await a.done();
+  });
+
+  await test('partial return: asks before dropping a changed quantity, Kurdish text', async () => {
+    const a = await phone();
+    await a.start('ku');
+    const T = await a.T('ku');
+    await a.js(() => {
+      db.equipment = [{ id: 'e2', name: 'سقالة', total: 40, rate: 1500 }];
+      db.customers = [{ id: 'c1', name: 'کاک ئازاد', phone: '', note: '' }];
+      db.rentals = [{ id: 'r1', customerId: 'c1', items: [{ equipmentId: 'e2', name: 'سقالة', qty: 20, rate: 1500 }], start: '2026-11-02', advance: 0, note: '', returnDate: null }];
+      commit();
+      goTab('rentals');
+    });
+    await a.p.tap('#list [data-act="return"]');
+    await a.sheetOpen();
+    await a.p.tap(`${SHEET} .sheet-head [data-close]`);
+    await a.closed(); // unchanged form closes silently
+    await a.p.tap('#list [data-act="return"]');
+    await a.sheetOpen();
+    has(await a.text(`${SHEET} .return-row`), T.out_of.replace('{n}', '20'), 'row in Kurdish');
+    await a.set('ret0', 5);
+    has(await a.text(`${SHEET} #stays`), `${T.stays_with}: سقالة ×15`, 'stays in Kurdish');
+    await a.p.tap(`${SHEET} .sheet-head [data-close]`);
+    await a.dialogOpen();
+    await a.p.tap(`${DIALOG} .dialog-actions [data-no]`);
+    await a.p.waitForTimeout(350);
+    eq(await a.val('ret0'), '5', 'kept');
+    // double tap on confirm: one split only
+    await a.js(() => { const s = document.querySelector('.ov-sheet:not(.closing) [type=submit]'); s.click(); s.click(); setTimeout(() => s.click(), 60); });
+    await a.closed();
+    await a.p.waitForTimeout(150);
+    eq(await a.js(() => [db.rentals.length, db.rentals[0].items[0].qty, db.rentals[1].items[0].qty]), [2, 15, 5], 'split happened once');
+    eq(await a.toast(), T.returned_part_ok, 'Kurdish toast');
+    await a.done();
+  });
+
+  await test('photos: camera or gallery, sideways pictures, sizes, remove, change, protect', async () => {
+    const a = await phone();
+    await a.start();
+    const T = await a.T();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hareem-photos-'));
+    // a big phone photo marked "rotated" in its EXIF data, the way phone cameras save portrait shots
+    const b64 = await a.js(() => {
+      const c = document.createElement('canvas');
+      c.width = 3000; c.height = 2000;
+      const g = c.getContext('2d');
+      const grad = g.createLinearGradient(0, 0, 3000, 2000);
+      grad.addColorStop(0, '#d94'); grad.addColorStop(1, '#25a');
+      g.fillStyle = grad; g.fillRect(0, 0, 3000, 2000);
+      for (let i = 0; i < 400; i++) { g.fillStyle = `hsl(${i * 7},70%,${30 + (i % 40)}%)`; g.fillRect((i * 37) % 3000, (i * 91) % 2000, 60, 60); }
+      return c.toDataURL('image/jpeg', 0.92).split(',')[1];
+    });
+    const jpeg = Buffer.from(b64, 'base64');
+    const exif = Buffer.concat([Buffer.from([0xFF, 0xE1, 0x00, 0x22]), Buffer.from('Exif\0\0', 'latin1'), Buffer.from([0x4D, 0x4D, 0x00, 0x2A, 0, 0, 0, 8, 0, 1, 0x01, 0x12, 0, 3, 0, 0, 0, 1, 0, 6, 0, 0, 0, 0, 0, 0])]);
+    const rotated = path.join(dir, 'camera.jpg');
+    fs.writeFileSync(rotated, Buffer.concat([jpeg.subarray(0, 2), exif, jpeg.subarray(2)]));
+    const plain = path.join(dir, 'plain.jpg');
+    fs.writeFileSync(plain, jpeg);
+    const notImage = path.join(dir, 'note.jpg');
+    fs.writeFileSync(notImage, 'this is not a picture');
+    const picture = () => a.js(() => { const i = document.querySelector('.ov-sheet:not(.closing) .photo-preview'); return i && i.complete ? [i.naturalWidth, i.naturalHeight] : null; });
+
+    await a.page('equipment');
+    await a.fab();
+    ok(await a.p.isVisible(`${SHEET} .photo-add`), 'add-picture button shown, nothing required');
+    // a file that isn't a picture
+    await a.choosePhoto(notImage);
+    eq(await a.err('photo'), T.photo_bad, 'bad file explained');
+    eq(await a.val('photo'), '', 'no picture kept');
+    // a real one: shrunk, stored small, and turned the right way up
+    await a.choosePhoto(rotated);
+    await a.p.waitForSelector(`${SHEET} .photo-preview`);
+    await a.p.waitForFunction(() => document.querySelector('.ov-sheet:not(.closing) .photo-preview').complete);
+    eq(await a.p.isVisible(`${SHEET} [data-err="photo"]`), false, 'error cleared');
+    eq(await picture(), [320, 480], '3000x2000 camera shot marked rotated becomes upright, longest side 480');
+    const size = (await a.val('photo')).length;
+    ok(size < 120 * 1024, `stored small: ${size} bytes`);
+    console.log(`        stored picture: ${Math.round(size / 1024)} KB from a ${Math.round(fs.statSync(rotated).size / 1024)} KB file`);
+    // unsaved picture is protected
+    await a.p.tap(`${SHEET} .sheet-head [data-close]`);
+    await a.dialogOpen();
+    await a.p.tap(`${DIALOG} .dialog-actions [data-no]`);
+    await a.p.waitForTimeout(350);
+    // picture only, no name, no price, default quantity
+    await a.save();
+    const e = await a.js(() => db.equipment[0]);
+    eq([e.name, e.total, e.rate, e.photo.startsWith('data:image/jpeg')], ['', 1, 0, true], 'saved with the picture alone');
+    const card = await a.text('#list .rc');
+    has(card, T.no_name, 'card falls back to "no name"');
+    eq(await a.js(() => { const i = document.querySelector('#list .rc img.thumb'); return i.complete && i.naturalWidth > 0; }), true, 'picture shows on the card');
+    // change, then remove, then put back, on the saved item
+    await a.p.tap('#list .rc-hit');
+    await a.sheetOpen();
+    await a.p.waitForFunction(() => document.querySelector('.ov-sheet:not(.closing) .photo-preview')?.complete);
+    await a.choosePhoto(plain);
+    await a.p.waitForFunction(() => { const i = document.querySelector('.ov-sheet:not(.closing) .photo-preview'); return i && i.complete && i.naturalWidth === 480; });
+    eq(await picture(), [480, 320], 'second picture keeps its own shape');
+    await a.p.tap(`${SHEET} [data-photo-del]`);
+    eq(await a.p.isVisible(`${SHEET} .photo-add`), true, 'back to the add button');
+    await a.submit();
+    eq(await a.err('name'), T.err_eq_empty, 'no name and no picture left');
+    await a.set('name', 'خلاطة كبيرة');
+    await a.save();
+    eq(await a.js(() => [db.equipment[0].name, db.equipment[0].photo]), ['خلاطة كبيرة', ''], 'picture removed');
+    has(await a.text('#list .rc'), 'خلاطة كبيرة', 'name shown');
+    eq(await a.p.$$eval('#list .rc img', (x) => x.length), 0, 'no picture on the card');
+    // if the fast decoder is missing the app still manages (older phones), under the strict security policy
+    await a.js(() => { window.createImageBitmap = () => Promise.reject(new Error('unsupported')); });
+    await a.p.tap('#list .rc-hit');
+    await a.sheetOpen();
+    await a.choosePhoto(plain);
+    await a.p.waitForFunction(() => { const i = document.querySelector('.ov-sheet:not(.closing) .photo-preview'); return i && i.complete && i.naturalWidth === 480; });
+    await a.save();
+    eq(await a.js(() => db.equipment[0].photo.length > 1000), true, 'fallback decoder worked');
+    // survives a restart
+    await a.p.reload();
+    await a.p.waitForSelector('.nav a');
+    eq(await a.js(() => db.equipment[0].photo.startsWith('data:image/jpeg')), true, 'picture kept after restart');
+    fs.rmSync(dir, { recursive: true, force: true });
+    await a.done();
+  });
+
+  await test('photos: choosing by picture, rentals, return, reports, backup, restore', async () => {
+    const a = await phone();
+    await a.start();
+    const T = await a.T();
+    const c = (n) => `${n} ${T.currency}`;
+    await a.js(() => {
+      const pic = (color) => { const k = document.createElement('canvas'); k.width = k.height = 200; const g = k.getContext('2d'); g.fillStyle = color; g.fillRect(0, 0, 200, 200); return k.toDataURL('image/jpeg', 0.7); };
+      db.equipment = [
+        { id: 'p1', name: '', total: 5, rate: 2000, photo: pic('#c33'), note: '' }, // picture only
+        { id: 'p2', name: 'سقالة', total: 10, rate: 1000, photo: pic('#3c3'), note: '' }, // name and picture
+        { id: 'p3', name: 'مولدة', total: 2, rate: 0, photo: '', note: '' }, // name only, no price
+      ];
+      commit();
+    });
+    await a.page('equipment');
+    eq(await a.p.$$eval('#list .rc img.thumb', (x) => x.length), 2, 'two cards with pictures');
+    has(await a.text('#list'), T.no_name, 'unnamed product is listed');
+    // the picker shows pictures; a picture-only product can be chosen
+    await a.tab('rentals');
+    await a.fab();
+    await a.p.tap(`${SHEET} [data-pick-eq]`);
+    await a.p.waitForSelector('.ov-picker:not(.closing) .eq-opt');
+    await a.p.waitForTimeout(340);
+    eq(await a.p.$$eval('.ov-picker:not(.closing) .eq-opt img', (x) => x.length), 2, 'pictures in the list');
+    // back button closes only the list, the form stays
+    await a.p.goBack();
+    await a.p.waitForFunction(() => !document.querySelector('.ov-picker:not(.closing)'));
+    eq(await a.p.isVisible(`${SHEET} [data-pick-eq]`), true, 'form still open');
+    await a.pickEquipment(0, '', 2);
+    has(await a.text(`${SHEET} [data-row]:nth-child(1) .eq-pick`), T.no_name, 'row shows the product');
+    eq(await a.p.$$eval(`${SHEET} [data-row]:nth-child(1) .eq-pick img`, (x) => x.length), 1, 'row shows its picture');
+    eq(await a.val('rate'), '2,000', 'its price is filled in');
+    await a.p.tap(`${SHEET} [data-add-row]`); // the list opens by itself for the new line
+    await a.pickEquipment(1, 'سقالة', 4);
+    await a.p.tap(`${SHEET} [data-add-row]`);
+    await a.pickEquipment(2, 'مولدة', 1);
+    eq(await a.p.inputValue(`${SHEET} [data-row]:nth-child(3) [name=rate]`), '', 'no price stays empty');
+    await a.p.tap(`${SHEET} [data-add-row]`);
+    await a.p.waitForSelector('.ov-picker:not(.closing)');
+    await a.p.waitForTimeout(340);
+    await a.p.goBack(); // a new line the user changed their mind about
+    await a.p.waitForFunction(() => !document.querySelector('.ov-picker:not(.closing)'));
+    await a.set('start', '2026-11-02');
+    eq(await a.text('#daily-sum'), c('8,000'), '2x2,000 + 4x1,000 + 1x0');
+    await a.save();
+    const rental = await a.js(() => db.rentals[0]);
+    eq(rental.items.map((i) => [i.equipmentId, i.qty, i.rate]), [['p1', 2, 2000], ['p2', 4, 1000], ['p3', 1, 0]], 'unfinished line ignored');
+    eq(JSON.stringify(rental).includes('data:image'), false, 'rentals do not copy the pictures');
+    has(await a.text('#list .rc'), `${T.no_name} ×2 · سقالة ×4 · مولدة ×1`, 'card text');
+    eq(await a.p.$$eval('#list .rc .mini-thumbs img', (x) => x.every((i) => i.complete) && x.length), 2, 'small pictures on the rental card');
+    has(await a.text('#list .rc'), c('40,000'), '8,000 x 5');
+    // partial return with pictures: the picture-only product comes back
+    await a.p.tap('#list [data-act="return"]');
+    await a.sheetOpen();
+    eq(await a.p.$$eval(`${SHEET} .return-row img`, (x) => x.length), 2, 'pictures on return rows');
+    await a.set('ret1', 0);
+    await a.set('ret2', 0);
+    eq(await a.val('total'), '20,000', '2 x 2,000 x 5');
+    await a.save();
+    await a.p.tap('#list .rc-hit');
+    await a.sheetOpen();
+    eq(await a.p.$$eval(`${SHEET} .line-item img`, (x) => x.length), 1, 'picture in the rental detail');
+    await a.js(() => closeAll());
+    await a.closed();
+    // a line without a price: the total is typed at return, and reports follow it
+    await a.p.tap('#list [data-act="return"]');
+    await a.sheetOpen();
+    eq(await a.val('total'), '20,000', '4 x 1,000 x 5 + 1 x 0');
+    await a.set('total', 35000);
+    await a.save();
+    eq(await a.js(() => { const s = stats(monthRange(0)); return [s.rent, s.cash, s.rentN]; }), [55000, 55000, 2], 'rent and cash');
+    await a.page('reports');
+    eq(await a.p.$$eval('.rank-row img', (x) => x.length), 2, 'pictures in the top products');
+    // backup carries the pictures to a new phone
+    await a.page('settings');
+    const [dl] = await Promise.all([a.p.waitForEvent('download'), a.p.tap('[data-act="backup-download"]')]);
+    const file = await dl.path();
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    eq(parsed.data.equipment.map((e) => !!e.photo), [true, true, false], 'pictures in the backup file');
+    const copy = path.join(os.tmpdir(), `hareem-${Date.now()}.txt`);
+    fs.copyFileSync(file, copy);
+    await a.done();
+    const b = await phone();
+    await b.open();
+    await b.p.waitForSelector('#welcome-form');
+    const [fc] = await Promise.all([b.p.waitForEvent('filechooser'), b.p.tap('#w-restore')]);
+    await fc.setFiles(copy);
+    await b.p.waitForSelector('.nav a');
+    await b.page('equipment');
+    eq(await b.p.$$eval('#list .rc img.thumb', (x) => x.length), 2, 'pictures restored on the new phone');
+    await b.p.waitForFunction(() => [...document.querySelectorAll('#list .rc img.thumb')].every((i) => i.complete && i.naturalWidth > 0));
+    fs.rmSync(copy, { force: true });
+    await b.done();
+  });
+
+  await test('optional: nothing is forced, unnamed records stay visible and correct', async () => {
+    const a = await phone();
+    await a.start();
+    const T = await a.T();
+    const c = (n) => `${n} ${T.currency}`;
+    await a.page('equipment');
+    // name only: no price needed
+    await a.fab();
+    await a.set('name', 'خلاطة');
+    await a.save();
+    eq(await a.js(() => [db.equipment[0].rate, db.equipment[0].total]), [0, 1], 'name alone is enough');
+    // rental with no customer and no price
+    await a.tab('rentals');
+    await a.fab();
+    await a.submit();
+    eq(await a.err('items'), T.err_items, 'a rental still needs one item');
+    await a.pickEquipment(0, 'خلاطة');
+    await a.set('start', '2026-11-04');
+    await a.save();
+    eq(await a.js(() => db.customers.map((x) => x.name)), [T.unnamed_customer], 'unnamed customer account created');
+    has(await a.text('#list .rc'), T.unnamed_customer, 'card says so');
+    // return: type the amount, leave part unpaid: the debt stays visible
+    await a.p.tap('#list [data-act="return"]');
+    await a.sheetOpen();
+    eq([await a.val('days'), await a.val('total'), await a.val('paid')], ['3', '0', '0'], 'no price means zero, not an error');
+    await a.set('total', 30000);
+    await a.set('paid', 10000);
+    await a.save();
+    await a.tab('debts');
+    eq(await a.text('.hero-value'), c('20,000'), 'debt counted');
+    has(await a.text('#list .rc'), T.unnamed_customer, 'debt listed under the unnamed account');
+    // a second nameless record uses the same account, also after switching language
+    await a.js(() => setLang('ku'));
+    await a.p.tap('[data-act="new-debt"]');
+    await a.sheetOpen();
+    await a.set('amount', 5000);
+    await a.save();
+    await a.js(() => setLang('ar'));
+    eq(await a.js(() => [db.customers.length, balances().get(db.customers[0].id)]), [1, 25000], 'one shared account');
+    // payment without a name
+    await a.p.tap('[data-act="new-payment"]');
+    await a.sheetOpen();
+    await a.submit();
+    eq(await a.err('amount'), T.err_amount, 'an amount is still needed');
+    await a.set('amount', 25000);
+    await a.save();
+    eq(await a.js(() => balances().get(db.customers[0].id)), 0, 'settled');
+    // rename it into a real person, then new nameless records start a new account
+    await a.page('customers');
+    await a.p.tap('#list .rc-hit');
+    await a.p.tap('[data-act="edit-customer"]');
+    await a.sheetOpen();
+    await a.set('name', 'حسن');
+    await a.save();
+    await a.tab('repairs');
+    await a.fab();
+    await a.set('problem', 'لا يشتغل');
+    await a.save();
+    eq(await a.js(() => db.customers.map((x) => x.name)), ['حسن', T.unnamed_customer], 'renamed customer keeps their records');
+    // repair with only a problem written, delivered without a price
+    const card = await a.text('#list .rc');
+    has(card, T.no_name, 'repair without a machine name'); has(card, 'لا يشتغل', 'problem shown');
+    await a.p.tap('#list .rc-hit');
+    await a.sheetOpen();
+    await a.p.tap(`${SHEET} [data-deliver]`);
+    await a.sheetOpen();
+    await a.save();
+    eq(await a.js(() => { const p = db.repairs[0]; return [p.status, p.price, p.paid, repairDue(p)]; }), ['delivered', 0, 0, 0], 'delivered with no price');
+    await a.page('reports');
+    has(await a.text('.big-stat .v'), c('30,000'), 'reports still add up');
+    // customer with a phone only
+    await a.page('customers');
+    await a.fab();
+    await a.submit();
+    eq(await a.err('name'), T.err_empty, 'completely empty is refused');
+    await a.set('phone', '07501234567');
+    await a.save();
+    has(await a.text('#list'), '07501234567', 'phone stands in for the name');
+    // a customer can also be named later on an existing rental's form
+    eq(await a.js(() => db.customers.every((x) => x.name)), true, 'every customer has a label');
+    await a.done();
+  });
+
+  await test('photos: 150 products with pictures stay fast on a slow phone', async () => {
+    const a = await phone();
+    await a.start();
+    await a.js(() => {
+      const k = document.createElement('canvas'); k.width = 480; k.height = 360;
+      const g = k.getContext('2d');
+      for (let i = 0; i < 900; i++) { g.fillStyle = `hsl(${i % 360},60%,${20 + (i % 60)}%)`; g.fillRect((i * 13) % 480, (i * 29) % 360, 14, 14); }
+      const data = k.toDataURL('image/jpeg', 0.72);
+      db.equipment = Array.from({ length: 150 }, (_, i) => ({ id: `e${i}`, name: i % 3 ? `معدة ${i}` : '', total: 100, rate: 1000, photo: `${data}`, note: '' }));
+      db.customers = [{ id: 'c', name: 'س', phone: '' }];
+      db.rentals = Array.from({ length: 40 }, (_, i) => ({ id: `r${i}`, customerId: 'c', items: [{ equipmentId: `e${i}`, name: `معدة ${i}`, qty: 1, rate: 1000 }, { equipmentId: `e${i + 1}`, name: '', qty: 1, rate: 1000 }], start: '2026-11-01', advance: 0, note: '', returnDate: null }));
+      commit();
+    });
+    await a.p.waitForTimeout(500);
+    const cdp = await a.ctx.newCDPSession(a.p);
+    await cdp.send('Emulation.setCPUThrottlingRate', { rate: 4 });
+    const timed = (src) => a.js(async (code) => { const t0 = performance.now(); (0, eval)(code); document.body.getBoundingClientRect(); return Math.round(performance.now() - t0); }, src);
+    const times = {
+      equipment: await timed("goPage('equipment')"),
+      rentals: await timed("goTab('rentals')"),
+      home: await timed("goTab('home')"),
+      picker: await timed("goTab('rentals'); rentalForm(); document.querySelector('.ov-sheet:not(.closing) [data-pick-eq]').click()"),
+      saveMs: await a.js(async () => { const t0 = performance.now(); await writeDb(); return Math.round(performance.now() - t0); }),
+      backupMs: await a.js(() => { const t0 = performance.now(); backupText(); return Math.round(performance.now() - t0); }),
+    };
+    const size = await a.js(() => Math.round(JSON.stringify(db).length / 1024 / 1024 * 10) / 10);
+    console.log(`        times on a 4x slower CPU (ms): ${J(times)}; data ${size} MB, photo ${await a.js(() => Math.round(db.equipment[0].photo.length / 1024))} KB each`);
+    await cdp.send('Emulation.setCPUThrottlingRate', { rate: 1 });
+    for (const [k, v] of Object.entries(times)) ok(v < 1500, `${k} too slow: ${v}ms`);
+    // the list can be searched
+    await a.p.fill('.ov-picker:not(.closing) input[type=search]', 'معدة 149');
+    await a.p.waitForTimeout(60);
+    eq(await a.p.$$eval('.ov-picker:not(.closing) .eq-opt:not([hidden])', (x) => x.map((o) => o.dataset.name)), ['معدة 149'], 'search in the list');
+    await a.js(() => closeAll());
+    await a.closed();
+    await a.done();
+  });
+
   await test('repairs: pending, ready, deliver, profit, edit, delete', async () => {
     const a = await phone();
     await a.start();
@@ -430,11 +899,9 @@ async function suite() {
     await a.tab('repairs');
     await a.fab();
     await a.submit();
-    eq(await a.err('customer'), T.err_customer, 'customer required');
+    eq(await a.err('device'), T.err_empty, 'a completely empty form is not a record');
     await a.pickCustomer('احمد', 'أحمد الجبوري'); // typed without the hamza
     eq(await a.p.isVisible(`${SHEET} .combo-new`), false, 'no phone field for an existing customer');
-    await a.submit();
-    eq(await a.err('device'), T.err_device, 'device required');
     await a.set('device', 'دريل هلتي');
     await a.set('problem', 'السويج عاطل');
     await a.set('dateIn', '2026-11-05');
@@ -448,8 +915,6 @@ async function suite() {
     await a.p.tap('[data-act="seg"][data-val="ready"]');
     await a.p.tap('#list [data-act="deliver"]');
     await a.sheetOpen();
-    await a.submit();
-    eq(await a.err('price'), T.err_price, 'price required');
     await a.set('price', 45000);
     eq(await a.val('paid'), '45,000', 'paid follows price');
     await a.set('parts', 15000);
@@ -519,7 +984,7 @@ async function suite() {
     await a.sheetOpen();
     await a.p.tap(`${SHEET} [data-edit]`);
     await a.sheetOpen();
-    eq(await a.p.$eval(`${SHEET} [data-row]:nth-child(1) select`, (s) => [s.value, s.selectedOptions[0].textContent]), ['gone', 'معدة محذوفة'], 'deleted equipment stays selectable');
+    eq([await a.p.inputValue(`${SHEET} [data-row]:nth-child(1) [name=eq]`), await a.text(`${SHEET} [data-row]:nth-child(1) .ep-name`)], ['gone', 'معدة محذوفة'], 'deleted equipment stays on the line');
     await a.set('note', 'تعديل');
     await a.save();
     eq(await a.js(() => db.rentals[0].items.map((i) => [i.equipmentId, i.name, i.qty])), [['gone', 'معدة محذوفة', 2], ['e1', 'خلاطة', 1]], 'nothing lost on save');
@@ -617,7 +1082,7 @@ async function suite() {
     await a.page('customers');
     await a.fab();
     await a.submit();
-    eq(await a.err('name'), T.err_name, 'name required');
+    eq(await a.err('name'), T.err_empty, 'needs a name or a phone');
     await a.set('name', 'احمد'); // same as أحمد
     await a.submit();
     eq(await a.err('name'), T.customer_exists, 'duplicate blocked');
@@ -1634,12 +2099,16 @@ const RICH = {
 };
 function seedRich(R) {
   const e = (id, name, total, rate) => ({ id, name, total, rate, note: '' });
-  db.equipment = [e('e1', R.eq1, 5, 125000), e('e2', 'سقالة حديد', 400, 1500), e('e3', 'مولدة 5 كيلو', 2, 35000), e('e4', 'هلتي تكسير', 3, 20000)];
+  const pic = (color) => { const k = document.createElement('canvas'); k.width = 320; k.height = 240; const g = k.getContext('2d'); g.fillStyle = color; g.fillRect(0, 0, 320, 240); g.fillStyle = '#fff'; g.fillRect(100, 70, 120, 100); return k.toDataURL('image/jpeg', 0.7); };
+  db.equipment = [e('e1', R.eq1, 5, 125000), e('e2', 'سقالة حديد', 400, 1500), e('e3', 'مولدة 5 كيلو', 2, 35000), e('e4', 'هلتي تكسير', 3, 20000), e('e5', '', 4, 0)];
+  db.equipment[1].photo = pic('#c0392b');
+  db.equipment[3].photo = pic('#2471a3');
+  db.equipment[4].photo = pic('#27ae60');
   db.customers = [{ id: 'c1', name: R.long, phone: '0770 123 4567', note: R.note }, { id: 'c2', name: R.kurd, phone: '0750 444 1122', note: '' }, { id: 'c3', name: 'علي', phone: '', note: '' }, { id: 'c4', name: 'سامي', phone: '', note: '' }];
   const line = (id, q) => { const x = db.equipment.find((v) => v.id === id); return { equipmentId: id, name: x.name, qty: q, rate: x.rate }; };
   const r = (id, c, items, start, ret, days, total, adv, paid, note = '') => ({ id, customerId: c, items, start, advance: adv, note, returnDate: ret, days, total, paidAtReturn: paid, createdAt: 1, updatedAt: 1 });
   db.rentals = [
-    r('r1', 'c1', [line('e1', 3), line('e2', 240), line('e3', 1), line('e4', 2)], '2026-09-02', null, null, null, 2500000, null, R.note),
+    r('r1', 'c1', [line('e1', 3), line('e2', 240), line('e3', 1), line('e4', 2), line('e5', 2)], '2026-09-02', null, null, null, 2500000, null, R.note),
     r('r2', 'c2', [line('e2', 20)], '2026-11-06', null, null, null, 0, null),
     r('r3', 'c1', [line('e1', 2), line('e4', 1)], '2026-08-01', '2026-11-05', 96, 24500000, 2000000, 10000000, R.note),
     r('r4', 'c3', [line('e3', 1)], '2026-10-20', '2026-11-02', 13, 455000, 0, 455000),
@@ -1697,7 +2166,7 @@ function auditPage() {
         else if (el.matches('input:not([data-money]), textarea')) { /* long text scrolls inside a field */ }
         else add('CLIPPED', el, `${el.scrollWidth}>${el.clientWidth}: ${(el.innerText || '').slice(0, 24)}`);
       }
-      if (clips && cs.overflowY !== 'visible' && el.scrollHeight > el.clientHeight + 2 && el.clientHeight > 0 && !el.matches('.card, .hero, .sheet, .sheet-body, .menu-card, .stepper, .rc-sub, .rc-title > span, textarea') && !el.closest('.sheet-body.scroll')) add('v-clipped', el, `${el.scrollHeight}>${el.clientHeight}`);
+      if (clips && cs.overflowY !== 'visible' && el.scrollHeight > el.clientHeight + 2 && el.clientHeight > 0 && !el.matches('.card, .hero, .sheet, .sheet-body, .menu-card, .stepper, .rc-sub, .rc-title > span, .ep-name, textarea') && !el.closest('.sheet-body.scroll')) add('v-clipped', el, `${el.scrollHeight}>${el.clientHeight}`);
       // text sticking out of its button, chip, tile or column
       const direct = [...el.childNodes].filter((n) => n.nodeType === 3 && n.textContent.trim());
       if (direct.length && cs.textOverflow !== 'ellipsis' && !el.matches('textarea, input, select')) {
@@ -1749,21 +2218,31 @@ const STATES = [
   ['reports-bottom', (a) => a.js(() => { goPage('reports'); window.scrollTo(0, 99999); })],
   ['settings', (a) => a.js(() => goPage('settings'))],
   ['settings-bottom', (a) => a.js(() => { goPage('settings'); window.scrollTo(0, 99999); })],
-  ['rental-new', (a) => a.js(() => {
+  ['rental-new', (a) => a.js(async () => {
+    const wait = () => new Promise((r) => setTimeout(r, 80));
     goTab('rentals'); rentalForm();
     const f = document.querySelector('.ov-sheet:not(.closing) form');
     f.elements.customerName.value = 'زبون جديد تماماً'; f.elements.customerName.dispatchEvent(new Event('input', { bubbles: true }));
-    f.querySelector('[data-add-row]').click();
-    const rows = f.querySelectorAll('[data-row]');
-    rows[0].querySelector('select').selectedIndex = 1; rows[0].querySelector('select').dispatchEvent(new Event('change', { bubbles: true }));
-    rows[1].querySelector('select').selectedIndex = 2; rows[1].querySelector('select').dispatchEvent(new Event('change', { bubbles: true }));
-    rows[0].querySelector('[name=qty]').value = '99'; rows[0].querySelector('[name=qty]').dispatchEvent(new Event('input', { bubbles: true }));
+    f.querySelector('[data-pick-eq]').click(); await wait();
+    document.querySelector('.ov-picker:not(.closing) .eq-opt[data-name="سقالة حديد"]').click(); await wait();
+    f.querySelector('[data-add-row]').click(); await wait();
+    document.querySelector('.ov-picker:not(.closing) .eq-opt[data-name="مولدة 5 كيلو"]').click(); await wait();
+    const q = f.querySelectorAll('[data-row]')[0].querySelector('[name=qty]');
+    q.value = '999'; q.dispatchEvent(new Event('input', { bubbles: true }));
   })],
+  ['eq-picker', (a) => a.js(() => { goTab('rentals'); rentalForm(); document.querySelector('.ov-sheet:not(.closing) [data-pick-eq]').click(); })],
+  ['equipment-photo', (a) => a.js(() => { goPage('equipment'); equipmentForm('e2'); })],
+  ['equipment-unnamed', (a) => a.js(() => { goPage('equipment'); equipmentForm('e5'); })],
+  ['equipment-errors', (a) => a.js(() => { goPage('equipment'); equipmentForm(); document.querySelector('.ov-sheet:not(.closing) form').requestSubmit(); })],
+  ['repair-errors', (a) => a.js(() => { goTab('repairs'); repairForm(); document.querySelector('.ov-sheet:not(.closing) form').requestSubmit(); })],
+  ['customer-errors', (a) => a.js(() => { goPage('customers'); customerForm(); document.querySelector('.ov-sheet:not(.closing) form').requestSubmit(); })],
   ['rental-errors', (a) => a.js(() => { goTab('rentals'); rentalForm(); document.querySelector('.ov-sheet:not(.closing) form').requestSubmit(); })],
   ['rental-detail-open', (a) => a.js(() => { goTab('rentals'); rentalDetail('r1'); })],
   ['rental-detail-closed', (a) => a.js(() => { goTab('rentals'); rentalDetail('r3'); })],
   ['rental-edit-closed', (a) => a.js(() => { goTab('rentals'); rentalForm('r3'); })],
   ['return', (a) => a.js(() => { goTab('rentals'); returnForm('r1'); const f = document.querySelector('.ov-sheet:not(.closing) form'); f.elements.paid.value = '1,000,000'; f.elements.paid.dispatchEvent(new Event('input', { bubbles: true })); })],
+  ['return-partial', (a) => a.js(() => { goTab('rentals'); returnForm('r1'); const f = document.querySelector('.ov-sheet:not(.closing) form'); for (const [n, v] of [['ret1', '100'], ['ret2', '0'], ['paid', '500,000']]) { f.elements[n].value = v; f.elements[n].dispatchEvent(new Event('input', { bubbles: true })); } })],
+  ['return-partial-err', (a) => a.js(() => { goTab('rentals'); returnForm('r2'); const f = document.querySelector('.ov-sheet:not(.closing) form'); f.elements.ret0.value = '0'; f.elements.ret0.dispatchEvent(new Event('input', { bubbles: true })); f.requestSubmit(); })],
   ['repair-new', (a) => a.js(() => { goTab('repairs'); repairForm(); })],
   ['repair-detail-pending', (a) => a.js(() => { goTab('repairs'); repairDetail('p1'); })],
   ['repair-detail-delivered', (a) => a.js(() => { goTab('repairs'); repairDetail('p3'); })],
@@ -1805,7 +2284,7 @@ async function auditCombo(width, height, lang, scheme, shoot, engine = 'chromium
     const { issues, text } = await a.js(auditPage);
     for (const i of issues) found.push({ state: name, issue: i });
     let t = text;
-    for (const v of [RICH.long, RICH.kurd, RICH.eq1, RICH.prob, RICH.note, 'سقالة حديد', 'مولدة 5 كيلو', 'هلتي تكسير', 'علي', 'سامي', 'مولدة كهرباء هوندا عشرة كيلو واط', 'دريل هلتي', 'السويج عاطل', 'خلاطة صغيرة', 'جلاخة بوش', 'بقية حساب قديم', 'زبون جديد تماماً', 'العربية', 'کوردی', 'هريم', 'أ', 'ك', 'ک', 'ع', 'س', 'خ', 'م']) t = t.split(v).join(' ');
+    for (const v of [RICH.long, RICH.kurd, RICH.eq1, RICH.prob, RICH.note, 'سقالة حديد', 'مولدة 5 كيلو', 'هلتي تكسير', 'علي', 'سامي', 'مولدة كهرباء هوندا عشرة كيلو واط', 'دريل هلتي', 'السويج عاطل', 'خلاطة صغيرة', 'جلاخة بوش', 'بقية حساب قديم', 'زبون جديد تماماً', 'العربية', 'کوردی', 'هريم', 'سقالة', 'مولدة', 'هلتي', 'أ', 'ك', 'ک', 'ع', 'س', 'خ', 'م']) t = t.split(v).join(' ');
     const wrong = lang === 'ku' ? t.match(/[كيةىأإآ]/g) : t.match(/[کیەێۆڵڕڤ]/g);
     if (wrong) found.push({ state: name, issue: `WRONG-LANGUAGE letters ${[...new Set(wrong)].join(' ')} in: ${t.replace(/\s+/g, ' ').slice(0, 160)}` });
     const bad = t.match(/\b[a-z]+_[a-z_]+\b|undefined|NaN|\bnull\b|Infinity|\{[a-z]+\}|\[object/);
