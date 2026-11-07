@@ -9,6 +9,7 @@ const { chromium, webkit, firefox, devices } = pw;
 const APP_DIR = path.resolve(__dirname, '../daftar');
 const SHOTS = process.env.SHOTS || path.join(os.tmpdir(), 'hareem-shots');
 const NOW = '2026-11-07T10:00:00+03:00';
+const APP_VERSION = fs.readFileSync(path.join(APP_DIR, 'sw.js'), 'utf8').match(/VERSION = '([^']+)'/)[1];
 const SHEET = '.ov-sheet:not(.closing)';
 const DIALOG = '.ov-dialog:not(.closing)';
 const filter = process.argv[2] || '';
@@ -1359,7 +1360,7 @@ async function suite() {
     await a.p.waitForFunction(() => navigator.serviceWorker.controller, null, { timeout: 5000 }).catch(() => {});
     await a.p.waitForTimeout(500);
     const cached = await a.js(async () => { const names = await caches.keys(); const c = await caches.open(names[0]); return { names, files: (await c.keys()).map((r) => new URL(r.url).pathname).sort() }; });
-    eq(cached.names, ['hareem-app-1.0.0'], 'one cache');
+    eq(cached.names, [`hareem-app-${APP_VERSION}`], 'one cache');
     for (const f of ['/', '/css/app.css', '/js/app.js', '/js/i18n.js', '/fonts/vazirmatn-arabic.woff2', '/fonts/vazirmatn-latin.woff2', '/manifest.webmanifest', '/icons/icon-192.png', '/icons/icon-512.png', '/icons/apple-touch-icon.png']) ok(cached.files.includes(f), `cached ${f}`);
     await a.ctx.setOffline(true);
     let reachable = true;
@@ -1406,30 +1407,30 @@ async function suite() {
     await a.p.waitForTimeout(400);
     await a.js(() => { db.customers.push({ id: 'keep', name: 'باقٍ', phone: '' }); commit(); });
     await a.p.waitForTimeout(150);
-    // publish version 1.0.1
+    // publish a new version
     const swFile = path.join(dir, 'sw.js');
-    fs.writeFileSync(swFile, fs.readFileSync(swFile, 'utf8').replace("const VERSION = '1.0.0'", "const VERSION = '1.0.1'"));
+    fs.writeFileSync(swFile, fs.readFileSync(swFile, 'utf8').replace(`const VERSION = '${APP_VERSION}'`, "const VERSION = '9.9.9'"));
     const appFile = path.join(dir, 'js/app.js');
-    fs.writeFileSync(appFile, fs.readFileSync(appFile, 'utf8').replace("const VERSION = '1.0.0'", "const VERSION = '1.0.1'"));
+    fs.writeFileSync(appFile, fs.readFileSync(appFile, 'utf8').replace(`const VERSION = '${APP_VERSION}'`, "const VERSION = '9.9.9'"));
     // first open after publishing: still the old files, new ones download in the background
     await a.p.reload();
     await a.p.waitForSelector('.nav a');
     await a.js(async () => { const r = await navigator.serviceWorker.getRegistration(); await r.update(); });
     for (let i = 0; i < 80; i++) {
       const keys = await a.js(() => caches.keys());
-      if (keys.length === 1 && keys[0] === 'hareem-app-1.0.1') break;
+      if (keys.length === 1 && keys[0] === 'hareem-app-9.9.9') break;
       await a.p.waitForTimeout(100);
     }
-    eq(await a.js(() => caches.keys()), ['hareem-app-1.0.1'], 'new files cached, old cache removed');
+    eq(await a.js(() => caches.keys()), ['hareem-app-9.9.9'], 'new files cached, old cache removed');
     // next open: the new version
     await a.p.reload();
     await a.p.waitForSelector('.nav a');
-    eq(await a.js(() => VERSION), '1.0.1', 'new version running');
+    eq(await a.js(() => VERSION), '9.9.9', 'new version running');
     eq(await a.js(() => db.customers.map((c) => c.id)), ['keep'], 'data intact after the update');
     await a.ctx.setOffline(true);
     await a.p.reload();
     await a.p.waitForSelector('.nav a');
-    eq(await a.js(() => VERSION), '1.0.1', 'new version works offline');
+    eq(await a.js(() => VERSION), '9.9.9', 'new version works offline');
     await a.ctx.setOffline(false);
     await a.ctx.close();
     site.close();
@@ -1449,6 +1450,7 @@ async function suite() {
     eq(inst.installabilityErrors, [], 'no installability errors');
     const parsed = JSON.parse(man.data);
     eq(parsed.name, 'هريم', 'name on the icon');
+    eq(await a.js(() => VERSION), APP_VERSION, 'app and offline worker have the same version');
     const head = await a.js(() => ({
       apple: document.querySelector('link[rel=apple-touch-icon]').href.split('/').pop(),
       appleTitle: document.querySelector('meta[name=apple-mobile-web-app-title]').content,
@@ -1475,11 +1477,21 @@ async function suite() {
     const missing = [];
     const listen = (pg) => pg.on('response', (r) => { if (r.status() >= 400) missing.push(`${r.status()} ${r.url()}`); });
     listen(page);
-    await a.start();
+    await a.open();
+    await page.waitForSelector('#welcome-form');
     eq(await a.js(() => [isSecureContext, !!crypto.subtle, !!crypto.randomUUID]), [true, true, true], 'secure context like https');
-    // here the service worker registers by itself, no ?sw needed
+    // here the service worker registers by itself, no ?sw needed, already on the welcome screen
     await a.js(() => navigator.serviceWorker.ready);
     await page.waitForFunction(() => navigator.serviceWorker.controller, null, { timeout: 8000 });
+    // internet lost right after installing, before "Start" was ever tapped: the app must still open
+    await ctx.setOffline(true);
+    a.problems.length = 0;
+    await page.reload();
+    await page.waitForSelector('#welcome-form');
+    eq(a.problems, [], 'welcome opens with no internet');
+    await ctx.setOffline(false);
+    await page.tap('#welcome-form [type=submit]');
+    await page.waitForSelector('.nav a');
     const reg = await a.js(async () => { const r = await navigator.serviceWorker.getRegistration(); const c = await caches.open((await caches.keys())[0]); return { scope: new URL(r.scope).pathname, files: (await c.keys()).map((k) => new URL(k.url).pathname).sort() }; });
     eq(reg.scope, '/hareem/', 'worker scope');
     ok(reg.files.every((f) => f.startsWith('/hareem/')) && reg.files.length === 13, `all 13 files cached under the sub-path: ${J(reg.files)}`);
@@ -1515,19 +1527,19 @@ async function suite() {
     // a release while the host caches files for 10 minutes: the phone must still get the new files
     for (const f of ['sw.js', 'js/app.js']) {
       const fp = path.join(dir, f);
-      fs.writeFileSync(fp, fs.readFileSync(fp, 'utf8').replace("const VERSION = '1.0.0'", "const VERSION = '1.0.1'"));
+      fs.writeFileSync(fp, fs.readFileSync(fp, 'utf8').replace(`const VERSION = '${APP_VERSION}'`, "const VERSION = '9.9.9'"));
     }
     await p2.reload();
     await p2.waitForSelector('.nav a');
     await a2.js(async () => { const r = await navigator.serviceWorker.getRegistration(); await r.update(); });
     for (let i = 0; i < 80; i++) {
       const keys = await a2.js(() => caches.keys());
-      if (keys.length === 1 && keys[0] === 'hareem-app-1.0.1') break;
+      if (keys.length === 1 && keys[0] === 'hareem-app-9.9.9') break;
       await p2.waitForTimeout(100);
     }
     await p2.reload();
     await p2.waitForSelector('.nav a');
-    eq(await a2.js(() => [VERSION, [...balances().values()]]), ['1.0.1', [5000]], 'new version, same data');
+    eq(await a2.js(() => [VERSION, [...balances().values()]]), ['9.9.9', [5000]], 'new version, same data');
     eq(missing, [], 'no missing files');
     await ctx.close();
     await browser.close();

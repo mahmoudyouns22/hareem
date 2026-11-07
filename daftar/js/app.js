@@ -2,7 +2,7 @@
    Vanilla JS, no build step. All data stays on the phone (IndexedDB). */
 'use strict';
 
-const VERSION = '1.0.0';
+const VERSION = '1.0.1';
 
 /* ================= helpers ================= */
 const $ = (s, r = document) => r.querySelector(s);
@@ -1998,11 +1998,11 @@ function startApp() {
   if (!history.state) history.replaceState({ d: 0, i: 0 }, '', location.hash || '#/home');
   route = parseRoute();
   render(true);
-  registerSW();
   askPersist();
   document.fonts?.ready.then(() => { if (!$('#app').hidden) fitNumbers(); });
 }
 async function boot() {
+  registerSW();
   db = await loadDb();
   lang = db.settings.lang || (/^(ckb|ku)/i.test(navigator.language || '') ? 'ku' : 'ar');
   applyTheme();
