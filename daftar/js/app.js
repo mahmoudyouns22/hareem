@@ -2,7 +2,7 @@
    Vanilla JS, no build step. All data stays on the phone (IndexedDB). */
 'use strict';
 
-const VERSION = '1.0.3';
+const VERSION = '1.0.4';
 
 /* ================= helpers ================= */
 const $ = (s, r = document) => r.querySelector(s);
@@ -67,6 +67,18 @@ function fmtDate(s, long) {
   if (long) out = `${L().weekdays[new Date(Date.UTC(y, m, d)).getUTCDay()]}، ${out}`;
   return out;
 }
+
+// 12-hour clock with the standard local words for morning/afternoon: 4:05 م / 4:05 د.ن
+function fmtTime(ms, seconds = false) {
+  const d = new Date(ms);
+  const h = d.getHours();
+  return `${h % 12 || 12}:${pad(d.getMinutes())}${seconds ? `:${pad(d.getSeconds())}` : ''}\u00A0${h < 12 ? t('am') : t('pm')}`;
+}
+const realTime = (at) => at > 1e12;
+// a record's date, plus the exact time when it was entered on that same day (a back-dated record has no known time)
+const when = (date, at, long) => (date ? `${fmtDate(date, long)}${realTime(at) && ymd(new Date(at)) === date ? ` · ${fmtTime(at, !!long)}` : ''}` : '');
+// the exact moment something was done, to the second
+const stamp = (at) => `${fmtDate(ymd(new Date(at)), true)} · ${fmtTime(at, true)}`;
 
 /* ================= icons (Lucide, ISC) ================= */
 const ICONS = {
@@ -160,13 +172,13 @@ async function photoToDataUrl(file) {
 
 /* ================= storage (IndexedDB, localStorage fallback) ================= */
 const DEFAULT_SETTINGS = { lang: null, shopName: 'هريم', theme: 'auto', lastBackup: null };
-const fresh = () => ({ v: 1, savedAt: 0, equipment: [], customers: [], rentals: [], repairs: [], ledger: [], settings: { ...DEFAULT_SETTINGS } });
+const fresh = () => ({ v: 1, savedAt: 0, equipment: [], customers: [], rentals: [], repairs: [], ledger: [], log: [], settings: { ...DEFAULT_SETTINGS } });
 let db = fresh();
 
 function normalizeDb(x) {
   const d = fresh();
   if (!x || typeof x !== 'object') return d;
-  for (const k of ['equipment', 'customers', 'rentals', 'repairs', 'ledger']) if (Array.isArray(x[k])) d[k] = x[k];
+  for (const k of ['equipment', 'customers', 'rentals', 'repairs', 'ledger', 'log']) if (Array.isArray(x[k])) d[k] = x[k];
   d.settings = { ...DEFAULT_SETTINGS, ...(x.settings || {}) };
   d.savedAt = x.savedAt || 0;
   return d;
@@ -329,6 +341,52 @@ function rentedQty(eqId, exceptRentalId) {
   }
   return n;
 }
+/* every action is written down with the exact moment it happened. Names are copied so deleted records still read
+   well; a missing name is kept empty and shown in the language in use when the log is read. */
+const LOG_MAX = 20000; // a few MB at most; the dates and times on the records themselves are kept forever
+function logAction(k, extra = {}) {
+  const e = { at: Date.now(), k };
+  for (const [key, v] of Object.entries(extra)) if (v !== '' && v != null) e[key] = v;
+  db.log.push(e);
+  if (db.log.length > LOG_MAX) db.log.splice(0, db.log.length - LOG_MAX);
+}
+const logCust = (cid) => ({ c: cid, cn: byId(db.customers, cid)?.name });
+const logRental = (k, r, extra) => logAction(k, { r: r.id, ...logCust(r.customerId), i: r.items.map((it) => [byId(db.equipment, it.equipmentId)?.name || it.name || '', it.qty]), ...extra });
+const logRepair = (k, p, extra) => logAction(k, { r: p.id, ...logCust(p.customerId), x: [p.device, p.problem].filter(Boolean).join(' · '), ...extra });
+const logLedger = (k, e) => logAction(k, { r: e.id, t: e.type, ...logCust(e.customerId), n: e.note, a: e.amount });
+const LOG_THING = /^(repair|ready|deliver|eq_)/;
+// the customer's name as it is now, or as it was if they were deleted
+function logWho(e, people) {
+  const c = e.c && (people ? people.get(e.c) : byId(db.customers, e.c));
+  return c ? c.name || '—' : e.cn || '';
+}
+const logWhat = (e) => (e.i ? e.i.map(([n, q]) => `${n || t('no_name')}\u00A0×${q}`).join(' · ') : LOG_THING.test(e.k) ? e.x || t('no_name') : '');
+// a record's content in a fixed form (sorted keys, empty values and bookkeeping times left out),
+// so saving a form without changing anything does not count as an edit
+function canonRec(v) {
+  if (Array.isArray(v)) return v.map(canonRec);
+  if (!v || typeof v !== 'object') return v;
+  const o = {};
+  for (const k of Object.keys(v).sort()) {
+    const c = canonRec(v[k]);
+    if (k !== 'updatedAt' && k !== 'editedAt' && c !== '' && c != null && c !== 0 && c !== false) o[k] = c;
+  }
+  return o;
+}
+const recSig = (x) => JSON.stringify(canonRec(x));
+const LOG_TITLES = {
+  rent: 'new_rental', return: 'return_title', return_part: 'log_return_part', rent_edit: 'edit_rental', rent_del: 'log_rent_del',
+  repair: 'new_repair', ready: 'marked_ready', deliver: 'deliver_title', repair_edit: 'edit_repair', repair_del: 'log_repair_del',
+  pay: 'record_payment', debt: 'add_debt', eq_new: 'new_equipment', eq_edit: 'edit_equipment', eq_del: 'log_eq_del',
+  cust_new: 'new_customer', cust_edit: 'edit_customer', cust_del: 'log_cust_del', backup: 'log_backup', restore: 'restore_confirm_title', wipe: 'wipe',
+};
+function logTitle(e) {
+  if (e.k === 'ledger_edit') return t(e.t === 'pay' ? 'edit_payment' : 'edit_debt');
+  if (e.k === 'ledger_del') return t(e.t === 'pay' ? 'log_pay_del' : 'log_debt_del');
+  return t(LOG_TITLES[e.k] || e.k);
+}
+const LOG_TARGET = { rent: 'rental', return: 'rental', return_part: 'rental', rent_edit: 'rental', repair: 'repair', ready: 'repair', deliver: 'repair', repair_edit: 'repair', pay: 'ledger', debt: 'ledger', ledger_edit: 'ledger', eq_new: 'equipment', eq_edit: 'equipment', cust_new: 'customer', cust_edit: 'customer' };
+const LOG_GROUPS = { rentals: /^(rent|return)/, repairs: /^(repair|ready|deliver)/, money: /^(pay|debt|ledger)/ };
 const hasRecords = (cid) => db.rentals.some((r) => r.customerId === cid) || db.repairs.some((p) => p.customerId === cid) || db.ledger.some((e) => e.customerId === cid);
 
 function monthRange(offset) {
@@ -384,8 +442,8 @@ function topEquipment(R) {
 
 /* ================= navigation & overlays ================= */
 const TABS = ['home', 'rentals', 'repairs', 'debts', 'more'];
-const PARENT = { equipment: 'more', customers: 'more', reports: 'more', settings: 'more', customer: 'debts' };
-const ui = { seg: { rentals: 'open', repairs: 'pending', period: 'month' }, q: {}, limit: {}, chartSel: null };
+const PARENT = { equipment: 'more', customers: 'more', reports: 'more', activity: 'more', settings: 'more', customer: 'debts' };
+const ui = { seg: { rentals: 'open', repairs: 'pending', period: 'month', activity: 'all' }, q: {}, limit: {}, chartSel: null };
 let route = { name: 'home', arg: null };
 let locked = false;
 
@@ -673,6 +731,7 @@ function resolveCustomer(form) {
   if (match) return match.id;
   const c = { id: uid(), name: name || t('unnamed_customer'), phone: latinDigits(form.elements.customerPhone?.value || '').trim(), note: '', createdAt: Date.now() };
   db.customers.push(c);
+  logAction('cust_new', { r: c.id, ...logCust(c.id) });
   return c.id;
 }
 
@@ -686,7 +745,7 @@ function rentalCard(r, inCustomer = false) {
       <div class="rc-main">
         <div class="rc-title"><span>${esc(name)}</span></div>
         <div class="rc-sub">${itemsText(r)}</div>${miniThumbs(r)}
-        <div class="rc-meta"><span>${icon('calendar')}${fmtDate(r.start)}</span><span>${icon('clock')}${L().since(daysBetween(r.start, today()))}</span></div>
+        <div class="rc-meta"><span>${icon('calendar')}${when(r.start, r.createdAt)}</span><span>${icon('clock')}${L().since(daysBetween(r.start, today()))}</span></div>
       </div>
       <div class="rc-end"><span class="rc-amount">${money(accrued(r))}</span>
         <button class="btn btn-sm btn-primary" data-act="return" data-id="${r.id}">${t('return_btn')}</button></div>
@@ -697,7 +756,7 @@ function rentalCard(r, inCustomer = false) {
     <div class="rc-main">
       <div class="rc-title"><span>${esc(name)}</span></div>
       <div class="rc-sub">${itemsText(r)}</div>${miniThumbs(r)}
-      <div class="rc-meta"><span>${icon('calendar')}${fmtDate(r.start)} ← ${fmtDate(r.returnDate)}</span><span>${icon('clock')}${L().days(r.days)}</span></div>
+      <div class="rc-meta"><span>${icon('calendar')}${fmtDate(r.start)} ← ${when(r.returnDate, r.returnedAt)}</span><span>${icon('clock')}${L().days(r.days)}</span></div>
     </div>
     <div class="rc-end"><span class="rc-amount">${money(r.total)}</span>
       ${due > 0 ? `<span class="chip chip-bad">${t('debt')} ${moneyText(due)}</span>` : `<span class="chip chip-good">${icon('check')}${t('settled')}</span>`}</div>
@@ -721,7 +780,7 @@ function repairCard(p, inCustomer = false) {
     <div class="rc-main">
       <div class="rc-title"><span>${esc(devName(p))}</span></div>
       ${name || p.problem ? `<div class="rc-sub">${[name, p.problem].filter(Boolean).map(esc).join(' · ')}</div>` : ''}
-      <div class="rc-meta"><span>${icon('calendar')}${fmtDate(delivered ? p.dateOut : p.dateIn)}</span>${delivered ? '' : `<span>${icon('clock')}${L().since(daysBetween(p.dateIn, today()))}</span>`}</div>
+      <div class="rc-meta"><span>${icon('calendar')}${delivered ? when(p.dateOut, p.deliveredAt) : when(p.dateIn, p.createdAt)}</span>${delivered ? '' : `<span>${icon('clock')}${L().since(daysBetween(p.dateIn, today()))}</span>`}</div>
     </div>
     <div class="rc-end">${end}</div>
   </article>`;
@@ -756,7 +815,8 @@ function historyEntries(cid) {
   for (const r of db.rentals) if (r.customerId === cid && !isOpen(r)) out.push({ date: r.returnDate, kind: 'rental', ref: r });
   for (const p of db.repairs) if (p.customerId === cid && p.status === 'delivered') out.push({ date: p.dateOut, kind: 'repair', ref: p });
   for (const e of db.ledger) if (e.customerId === cid) out.push({ date: e.date, kind: e.type, ref: e });
-  return out.sort((a, b) => b.date.localeCompare(a.date) || (b.ref.createdAt || 0) - (a.ref.createdAt || 0));
+  const moment = (h) => h.ref.returnedAt || h.ref.deliveredAt || h.ref.createdAt || 0;
+  return out.sort((a, b) => b.date.localeCompare(a.date) || moment(b) - moment(a));
 }
 function histCard(h) {
   const x = h.ref;
@@ -768,7 +828,7 @@ function histCard(h) {
     <div class="rc-main">
       <div class="rc-title"><span>${pay ? t('payment') : t('debt')}</span></div>
       ${x.note ? `<div class="rc-sub">${esc(x.note)}</div>` : ''}
-      <div class="rc-meta"><span>${icon('calendar')}${fmtDate(x.date)}</span></div>
+      <div class="rc-meta"><span>${icon('calendar')}${when(x.date, x.createdAt)}</span></div>
     </div>
     <div class="rc-end"><span class="rc-amount ${pay ? 'good' : 'bad'}">${money(x.amount)}</span></div>
   </article>`;
@@ -803,8 +863,73 @@ function pageHome() {
     ${db.equipment.length ? '' : `<section class="card" style="margin-top:12px">${emptyState('package', t('no_equipment'), t('need_equipment'), `<button class="btn btn-primary" data-act="page" data-page="equipment">${icon('plus')}${t('add_equipment_btn')}</button>`)}</section>`}
     <div class="sec"><h2>${t('open_rentals_list')}</h2>${open.length > 5 ? `<button class="link" data-act="tab" data-tab="rentals">${t('see_all')}${icon('chevron-left')}</button>` : ''}</div>
     ${open.length ? `<div class="list">${open.slice(0, 5).map((r) => rentalCard(r)).join('')}</div>` : emptyInline(t('empty_home_rentals'))}
-    ${ready.length ? `<div class="sec"><h2>${t('ready_pickup')}</h2></div><div class="list">${ready.map((p) => repairCard(p)).join('')}</div>` : ''}`;
+    ${ready.length ? `<div class="sec"><h2>${t('ready_pickup')}</h2></div><div class="list">${ready.map((p) => repairCard(p)).join('')}</div>` : ''}
+    ${db.log.length ? `<div class="sec"><h2>${t('recent_activity')}</h2><button class="link" data-act="page" data-page="activity">${t('see_all')}${icon('chevron-left')}</button></div>
+      <div class="log-list">${logBlocks(db.log.slice(-5).reverse())}</div>` : ''}`;
   return { title: db.settings.shopName || t('app_name'), sub: fmtDate(today(), 'noyear'), brand: true, actions: langButton(), html };
+}
+
+function dayLabel(d) {
+  const ago = daysBetween(d, today());
+  return `${ago === 0 ? `${t('today')} · ` : ago === 1 ? `${t('yesterday')} · ` : ''}${fmtDate(d, true)}`;
+}
+function logRow(e) {
+  const target = LOG_TARGET[e.k];
+  const list = { rental: db.rentals, repair: db.repairs, ledger: db.ledger, equipment: db.equipment, customer: db.customers }[target];
+  const exists = !!(list && byId(list, e.r));
+  const sub = [logWho(e), logWhat(e), e.n].filter(Boolean).map(esc).join(' · ');
+  const amount = e.a != null ? `<span class="log-amt ${e.k === 'pay' || e.t === 'pay' ? 'good' : e.k === 'debt' || e.t === 'debt' ? 'bad' : ''}">${money(e.a)}</span>` : '';
+  const inner = `<span class="log-time">${fmtTime(e.at, true)}</span>
+    <span class="log-main">
+      <span class="log-head"><span class="log-title">${esc(logTitle(e))}${target && !exists ? ` <span class="chip">${t('log_deleted')}</span>` : ''}</span>${amount}</span>
+      ${sub ? `<span class="log-sub">${sub}</span>` : ''}${e.p ? `<span class="log-paid">${t('paid')} ${moneyText(e.p)}</span>` : ''}</span>`;
+  return exists ? `<button class="log-row" data-act="log" data-target="${target}" data-id="${esc(e.r)}">${inner}</button>` : `<div class="log-row">${inner}</div>`;
+}
+// newest first, one card per day
+function logBlocks(rows) {
+  let html = '', day = null, card = '';
+  const flush = () => { if (card) html += `<div class="card log-card">${card}</div>`; card = ''; };
+  for (const e of rows) {
+    const d = ymd(new Date(e.at));
+    if (d !== day) { flush(); day = d; html += `<div class="day-head">${dayLabel(d)}</div>`; }
+    card += logRow(e);
+  }
+  flush();
+  return html;
+}
+let logMemo = new Map();
+function logNorm(s) {
+  let v = logMemo.get(s);
+  if (v === undefined) { v = norm(s); logMemo.set(s, v); }
+  return v;
+}
+function logMatches(e, words, people) {
+  const parts = [logTitle(e), logWho(e, people), e.n];
+  if (e.i) for (const [n] of e.i) parts.push(n || t('no_name'));
+  else if (LOG_THING.test(e.k)) parts.push(e.x || t('no_name'));
+  return words.every((w) => parts.some((p) => p && logNorm(p).includes(w)));
+}
+function listActivity() {
+  const q = norm(ui.q.activity || '');
+  const group = LOG_GROUPS[ui.seg.activity];
+  let rows = db.log.slice().reverse();
+  if (group) rows = rows.filter((e) => group.test(e.k));
+  if (q.trim()) {
+    const people = new Map(db.customers.map((c) => [c.id, c]));
+    const words = q.split(/\s+/).filter(Boolean);
+    rows = rows.filter((e) => logMatches(e, words, people));
+  }
+  if (!rows.length) return q.trim() ? emptyInline(t('no_results')) : emptyState('clock', t('no_activity'));
+  const limit = ui.limit.activity || LIST_STEP;
+  return logBlocks(rows.slice(0, limit)) + (rows.length > limit ? `<button class="btn btn-ghost btn-block" data-act="more" data-key="activity" style="margin-top:12px">${t('show_more')} (${rows.length - limit})</button>` : '');
+}
+function pageActivity() {
+  logMemo = new Map();
+  return {
+    title: t('activity'), back: true,
+    html: `${segCtl('activity', [['all', t('p_all')], ['rentals', t('nav_rentals')], ['repairs', t('nav_repairs')], ['money', t('nav_debts')]])}
+      ${searchBox('activity')}<div id="list" class="log-list">${listActivity()}</div>`,
+  };
 }
 
 function pageRentals() {
@@ -886,6 +1011,7 @@ function pageMore() {
     ['equipment', 'package', t('equipment'), t('menu_equipment_hint'), db.equipment.length],
     ['customers', 'users', t('customers'), t('menu_customers_hint'), db.customers.length],
     ['reports', 'chart', t('reports'), t('menu_reports_hint')],
+    ['activity', 'clock', t('activity'), t('menu_activity_hint')],
     ['settings', 'settings', t('settings'), t('menu_settings_hint')],
   ];
   const menu = items.map(([p, ic, title, hint, n]) => `<button class="menu-item" data-act="page" data-page="${p}">
@@ -1073,8 +1199,8 @@ function bindSettings() {
   }).catch(() => {});
 }
 
-const PAGES = { home: pageHome, rentals: pageRentals, repairs: pageRepairs, debts: pageDebts, more: pageMore, equipment: pageEquipment, customers: pageCustomers, customer: pageCustomer, reports: pageReports, settings: pageSettings };
-const LISTS = { rentals: listRentals, repairs: listRepairs, debts: listDebts, customers: listCustomers, equipment: listEquipment };
+const PAGES = { home: pageHome, rentals: pageRentals, repairs: pageRepairs, debts: pageDebts, more: pageMore, equipment: pageEquipment, customers: pageCustomers, customer: pageCustomer, reports: pageReports, activity: pageActivity, settings: pageSettings };
+const LISTS = { rentals: listRentals, repairs: listRepairs, debts: listDebts, customers: listCustomers, equipment: listEquipment, activity: listActivity };
 
 function renderNav(active) {
   const items = [['home', 'home', t('nav_home')], ['rentals', 'hammer', t('nav_rentals')], ['repairs', 'wrench', t('nav_repairs')], ['debts', 'wallet', t('nav_debts')], ['more', 'grid', t('nav_more')]];
@@ -1257,13 +1383,20 @@ async function saveRental(form, r) {
   if (r && !isOpen(r) && (f.returnDate.value || r.returnDate) < start) return showErr(form, 'dates', t('err_dates'));
   const fields = { customerId: resolveCustomer(form), items, start, advance: toInt(f.advance.value), note: f.note.value.trim(), updatedAt: Date.now() };
   if (r) {
+    const before = recSig(r);
     Object.assign(r, fields);
     if (!isOpen(r)) {
       const returnDate = f.returnDate.value || r.returnDate;
       Object.assign(r, { returnDate, days: rentDays(start, returnDate), total: toInt(f.total.value), paidAtReturn: toInt(f.paidAtReturn.value) });
     }
+    if (recSig(r) !== before) {
+      r.editedAt = Date.now();
+      logRental('rent_edit', r);
+    }
   } else {
-    db.rentals.push({ id: uid(), ...fields, returnDate: null, createdAt: Date.now() });
+    const rental = { id: uid(), ...fields, returnDate: null, createdAt: Date.now() };
+    db.rentals.push(rental);
+    logRental('rent', rental, rental.advance ? { p: rental.advance } : {});
   }
   await closeOverlay();
   commit(t('saved'));
@@ -1359,17 +1492,22 @@ function returnForm(id) {
         const used = advanceUsed(q, total);
         const rem = total - used - paid;
         // overpayment is handed back, so it never shows up as credit
-        const closing = { returnDate, days: Math.max(1, toInt(f.days.value)), total, paidAtReturn: rem < 0 ? paid + rem : paid, updatedAt: Date.now() };
+        const now = Date.now();
+        const closing = { returnDate, days: Math.max(1, toInt(f.days.value)), total, paidAtReturn: rem < 0 ? paid + rem : paid, returnedAt: now, updatedAt: now };
         if (partial) {
-          db.rentals.push({
-            id: uid(), customerId: r.customerId, start: r.start, advance: used, note: r.note, createdAt: Date.now(), ...closing,
+          // the returned part keeps the moment it was taken out
+          const part = {
+            id: uid(), customerId: r.customerId, start: r.start, advance: used, note: r.note, createdAt: r.createdAt || now, ...closing,
             items: r.items.map((it, i) => ({ ...it, qty: q[i] })).filter((it) => it.qty > 0),
-          });
+          };
+          db.rentals.push(part);
           r.items = r.items.map((it, i) => ({ ...it, qty: it.qty - q[i] })).filter((it) => it.qty > 0);
           r.advance = adv - used;
-          r.updatedAt = Date.now();
+          r.updatedAt = now;
+          logRental('return_part', part, { a: total, p: closing.paidAtReturn });
         } else {
           Object.assign(r, closing);
+          logRental('return', r, { a: total, p: closing.paidAtReturn });
         }
         await closeOverlay();
         commit(partial ? t('returned_part_ok') : t('returned_ok'));
@@ -1379,6 +1517,9 @@ function returnForm(id) {
   });
 }
 
+// when a record was entered and last changed, to the second
+const timeRows = (x, row, day) => `${realTime(x.createdAt) && ymd(new Date(x.createdAt)) !== day ? row(t('recorded_at'), stamp(x.createdAt)) : ''}${realTime(x.editedAt) ? row(t('edited_at'), stamp(x.editedAt)) : ''}`;
+const timeHint = (x) => (realTime(x?.createdAt) ? `<p class="hint rec-hint">${icon('clock')}<span>${t('recorded_at')}: ${stamp(x.createdAt)}${realTime(x.editedAt) ? `<br>${t('edited_at')}: ${stamp(x.editedAt)}` : ''}</span></p>` : '');
 function rentalDetail(id) {
   const r = byId(db.rentals, id);
   if (!r) return;
@@ -1389,13 +1530,14 @@ function rentalDetail(id) {
       ${open ? `<span class="chip chip-brand">${t('status_open')}</span>` : `<span class="chip">${t('status_returned')}</span>`}</div>
     <div class="line-items">${r.items.map((i) => `<div class="line-item">${itemPhoto(i) ? eqThumb(itemPhoto(i)) : ''}<span class="li-name">${esc(itemName(i))}</span><span class="li-rate">${moneyText(i.rate)} ${t('per_day')}</span><span class="li-qty">×${i.qty}</span></div>`).join('')}</div>
     <div class="kv">
-      ${row(t('start_date'), fmtDate(r.start, true))}
-      ${open ? row(t('days_count'), L().days(rentDays(r.start, today()))) : row(t('return_date'), fmtDate(r.returnDate, true)) + row(t('days_count'), L().days(r.days))}
+      ${row(t('start_date'), when(r.start, r.createdAt, true))}
+      ${open ? row(t('days_count'), L().days(rentDays(r.start, today()))) : row(t('return_date'), when(r.returnDate, r.returnedAt, true)) + row(t('days_count'), L().days(r.days))}
       ${row(t('daily_total'), money(dailyOf(r)))}
       ${open ? row(t('rent_so_far'), money(accrued(r))) : row(t('rent_total'), money(r.total))}
       ${r.advance ? row(t('advance'), money(r.advance)) : ''}
       ${!open && r.paidAtReturn ? row(t('paid_at_return'), money(r.paidAtReturn)) : ''}
       ${!open ? row(due > 0 ? t('became_debt') : t('remaining'), due > 0 ? money(due) : t('settled'), due > 0 ? 'bad' : 'good') : ''}
+      ${timeRows(r, row, r.start)}
     </div>
     ${r.note ? `<div class="note-box">${esc(r.note)}</div>` : ''}`;
   sheet({
@@ -1410,6 +1552,7 @@ function rentalDetail(id) {
         else if (e.target.closest('[data-ret]')) { await closeAll(); returnForm(id); }
         else if (e.target.closest('[data-del]')) {
           if (!(await confirmDelete())) return;
+          logRental('rent_del', r);
           db.rentals = db.rentals.filter((x) => x.id !== id);
           await closeAll();
           commit(t('deleted'));
@@ -1458,10 +1601,17 @@ function repairForm(id) {
         };
         fields.customerId = resolveCustomer(form);
         if (p) {
+          const before = recSig(p);
           Object.assign(p, fields);
           if (delivered) Object.assign(p, { dateOut: f.dateOut.value || p.dateOut, paid: toInt(f.paid.value) });
+          if (recSig(p) !== before) {
+            p.editedAt = Date.now();
+            logRepair('repair_edit', p);
+          }
         } else {
-          db.repairs.push({ id: uid(), ...fields, status: 'pending', paid: 0, dateOut: null, createdAt: Date.now() });
+          const repair = { id: uid(), ...fields, status: 'pending', paid: 0, dateOut: null, createdAt: Date.now() };
+          db.repairs.push(repair);
+          logRepair('repair', repair);
         }
         await closeOverlay();
         commit(t('saved'));
@@ -1483,12 +1633,14 @@ function repairDetail(id) {
     ${delivered ? '' : `<div class="btn-row" style="margin-bottom:14px">${p.status === 'pending' ? `<button type="button" class="btn btn-ghost" data-ready>${icon('check')}${t('mark_ready')}</button>` : ''}<button type="button" class="btn btn-primary" data-deliver>${t('deliver')}</button></div>`}
     <div class="kv">
       ${p.problem ? row(t('problem'), esc(p.problem)) : ''}
-      ${row(t('date_in'), fmtDate(p.dateIn, true))}
-      ${delivered ? row(t('date_out'), fmtDate(p.dateOut, true)) : ''}
+      ${row(t('date_in'), when(p.dateIn, p.createdAt, true))}
+      ${realTime(p.readyAt) ? row(t('ready_at'), stamp(p.readyAt)) : ''}
+      ${delivered ? row(t('date_out'), when(p.dateOut, p.deliveredAt, true)) : ''}
       ${p.price ? row(t('price'), money(p.price)) : ''}
       ${p.parts ? row(t('parts_cost'), money(p.parts)) : ''}
       ${p.price ? row(t('profit'), money(profit), profit < 0 ? 'bad' : 'good') : ''}
       ${delivered ? row(t('paid'), money(p.paid)) + row(due > 0 ? t('became_debt') : t('remaining'), due > 0 ? money(due) : t('settled'), due > 0 ? 'bad' : 'good') : ''}
+      ${timeRows(p, row, p.dateIn)}
     </div>
     ${p.note ? `<div class="note-box">${esc(p.note)}</div>` : ''}`;
   sheet({
@@ -1503,6 +1655,7 @@ function repairDetail(id) {
         else if (e.target.closest('[data-ready]')) { await closeAll(); markReady(id); }
         else if (e.target.closest('[data-del]')) {
           if (!(await confirmDelete())) return;
+          logRepair('repair_del', p);
           db.repairs = db.repairs.filter((x) => x.id !== id);
           await closeAll();
           commit(t('deleted'));
@@ -1515,7 +1668,8 @@ function markReady(id) {
   const p = byId(db.repairs, id);
   if (!p) return;
   p.status = 'ready';
-  p.updatedAt = Date.now();
+  p.readyAt = p.updatedAt = Date.now();
+  logRepair('ready', p);
   commit(t('marked_ready'));
 }
 
@@ -1561,8 +1715,9 @@ function deliverForm(id) {
         const price = toInt(f.price.value);
         Object.assign(p, {
           status: 'delivered', price, parts: toInt(f.parts.value), paid: Math.min(price, toInt(f.paid.value)),
-          dateOut, updatedAt: Date.now(),
+          dateOut, deliveredAt: Date.now(), updatedAt: Date.now(),
         });
+        logRepair('deliver', p, { a: p.price, p: p.paid });
         await closeOverlay();
         commit(t('delivered_ok'));
       });
@@ -1577,7 +1732,7 @@ function ledgerForm(type, { cid, id } = {}) {
   if (entry) { type = entry.type; cid = entry.customerId; }
   const pay = type === 'pay';
   const title = entry ? (pay ? t('edit_payment') : t('edit_debt')) : (pay ? t('record_payment') : t('add_debt'));
-  const body = `${customerField(cid)}
+  const body = `${timeHint(entry)}${customerField(cid)}
     <div class="summary" id="cur-debt" hidden></div>
     <div class="field"><label for="m-amount">${t('amount')}</label>${moneyInput('amount', entry?.amount, { id: 'm-amount' })}
       ${pay ? `<div class="quick-fill" id="fill-all" hidden><button type="button" data-fill-all>${t('pay_all_debt')}</button></div>` : ''}
@@ -1617,6 +1772,7 @@ function ledgerForm(type, { cid, id } = {}) {
         if (e.target.closest('[data-fill-all]') && current > 0) { f.amount.value = num(current); updateResult(); }
         if (e.target.closest('[data-del]')) {
           if (!(await confirmDelete())) return;
+          logLedger('ledger_del', entry);
           db.ledger = db.ledger.filter((x) => x.id !== entry.id);
           await closeAll();
           commit(t('deleted'));
@@ -1627,8 +1783,18 @@ function ledgerForm(type, { cid, id } = {}) {
         const amount = toInt(f.amount.value);
         if (amount <= 0) return showErr(form, 'amount', t('err_amount'));
         const fields = { customerId: resolveCustomer(form), amount, date: f.date.value || today(), note: f.note.value.trim(), updatedAt: Date.now() };
-        if (entry) Object.assign(entry, fields);
-        else db.ledger.push({ id: uid(), type, ...fields, createdAt: Date.now() });
+        if (entry) {
+          const before = recSig(entry);
+          Object.assign(entry, fields);
+          if (recSig(entry) !== before) {
+            entry.editedAt = Date.now();
+            logLedger('ledger_edit', entry);
+          }
+        } else {
+          const line = { id: uid(), type, ...fields, createdAt: Date.now() };
+          db.ledger.push(line);
+          logLedger(pay ? 'pay' : 'debt', line);
+        }
         await closeOverlay();
         commit(pay ? t('payment_saved') : t('debt_saved'));
       });
@@ -1639,7 +1805,7 @@ function ledgerForm(type, { cid, id } = {}) {
 /* ================= sheets: customers & equipment ================= */
 function customerForm(id) {
   const c = id ? byId(db.customers, id) : null;
-  const body = `<div class="field"><label for="f-name">${t('name')}${optLabel()}</label><input class="input" id="f-name" name="name" value="${esc(c?.name || '')}" maxlength="60" autocomplete="off"><div class="err" data-err="name" hidden></div></div>
+  const body = `${timeHint(c)}<div class="field"><label for="f-name">${t('name')}${optLabel()}</label><input class="input" id="f-name" name="name" value="${esc(c?.name || '')}" maxlength="60" autocomplete="off"><div class="err" data-err="name" hidden></div></div>
     <div class="field"><label for="f-phone">${t('phone')}${optLabel()}</label><input class="input ltr-input" id="f-phone" name="phone" type="tel" inputmode="tel" value="${esc(c?.phone || '')}" placeholder="07xx xxx xxxx" maxlength="20"></div>
     <div class="field"><label for="f-note">${t('note')}${optLabel()}</label><textarea class="input" id="f-note" name="note" rows="2" placeholder="${t('note_ph')}">${esc(c?.note || '')}</textarea></div>`;
   sheet({
@@ -1653,6 +1819,7 @@ function customerForm(id) {
         if (!e.target.closest('[data-del]')) return;
         if (hasRecords(c.id)) { await confirmBox({ title: t('delete'), message: t('customer_has_records'), ok: t('close') }); return; }
         if (!(await confirmDelete())) return;
+        logAction('cust_del', logCust(c.id));
         db.customers = db.customers.filter((x) => x.id !== c.id);
         await closeAll();
         persist();
@@ -1666,8 +1833,18 @@ function customerForm(id) {
         if (!name) return showErr(form, 'name', t('err_empty'));
         if (db.customers.some((x) => x.id !== c?.id && norm(x.name) === norm(name))) return showErr(form, 'name', t('customer_exists'));
         const fields = { name, phone, note: f.note.value.trim(), updatedAt: Date.now() };
-        if (c) Object.assign(c, fields);
-        else db.customers.push({ id: uid(), ...fields, createdAt: Date.now() });
+        if (c) {
+          const before = recSig(c);
+          Object.assign(c, fields);
+          if (recSig(c) !== before) {
+            c.editedAt = Date.now();
+            logAction('cust_edit', { r: c.id, ...logCust(c.id) });
+          }
+        } else {
+          const person = { id: uid(), ...fields, createdAt: Date.now() };
+          db.customers.push(person);
+          logAction('cust_new', { r: person.id, ...logCust(person.id) });
+        }
         await closeOverlay();
         commit(t('saved'));
       });
@@ -1678,7 +1855,7 @@ function customerForm(id) {
 function equipmentForm(id) {
   const e = id ? byId(db.equipment, id) : null;
   const out = e ? rentedQty(e.id) : 0;
-  const body = `<div class="field"><span class="label">${t('photo')}${optLabel()}</span>
+  const body = `${timeHint(e)}<div class="field"><span class="label">${t('photo')}${optLabel()}</span>
       <input type="hidden" name="photo"><input type="file" id="photo-file" accept="image/*" hidden>
       <div id="photo-box"></div><div class="err" data-err="photo" hidden></div></div>
     <div class="field"><label for="f-name">${t('equipment_name')}${optLabel()}</label><input class="input" id="f-name" name="name" value="${esc(e?.name || '')}" placeholder="${t('equipment_name_ph')}" maxlength="60" autocomplete="off"><div class="err" data-err="name" hidden></div></div>
@@ -1720,6 +1897,7 @@ function equipmentForm(id) {
         if (!ev.target.closest('[data-del]')) return;
         if (out) { await confirmBox({ title: t('delete'), message: t('equipment_in_use'), ok: t('close') }); return; }
         if (!(await confirmDelete())) return;
+        logAction('eq_del', { x: e.name });
         db.equipment = db.equipment.filter((x) => x.id !== e.id);
         await closeAll();
         commit(t('deleted'));
@@ -1732,8 +1910,18 @@ function equipmentForm(id) {
         const total = Math.max(1, toInt(f.total.value));
         if (total < out) return showErr(form, 'total', t('err_total_lt_rented', { n: out }));
         const fields = { name, total, rate: toInt(f.rate.value), photo: f.photo.value, note: f.note.value.trim(), updatedAt: Date.now() };
-        if (e) Object.assign(e, fields);
-        else db.equipment.push({ id: uid(), ...fields, createdAt: Date.now() });
+        if (e) {
+          const before = recSig(e);
+          Object.assign(e, fields);
+          if (recSig(e) !== before) {
+            e.editedAt = Date.now();
+            logAction('eq_edit', { r: e.id, x: e.name });
+          }
+        } else {
+          const item = { id: uid(), ...fields, createdAt: Date.now() };
+          db.equipment.push(item);
+          logAction('eq_new', { r: item.id, x: item.name });
+        }
         await closeOverlay();
         commit(t('saved'));
       });
@@ -1749,6 +1937,7 @@ const backupText = () => JSON.stringify({ app: BACKUP_APP, format: 1, version: V
 const backupName = () => `hareem-backup-${today()}.txt`;
 function markBackup() {
   db.settings.lastBackup = new Date().toISOString();
+  logAction('backup');
   persist();
   render();
   toast(t('backup_ready'));
@@ -1798,6 +1987,7 @@ async function onRestoreFile(e) {
   const keep = { lang, theme: db.settings.theme };
   db = normalizeDb(parsed.data);
   Object.assign(db.settings, keep);
+  logAction('restore');
   await writeDb();
   askPersist();
   applyTheme();
@@ -1813,6 +2003,7 @@ async function wipeAll() {
   const keep = { lang, theme: db.settings.theme };
   db = fresh();
   Object.assign(db.settings, keep);
+  logAction('wipe');
   setPin(null);
   await writeDb();
   goTab('home');
@@ -2036,6 +2227,10 @@ const ACTIONS = {
   tab: (el) => goTab(el.dataset.tab),
   page: (el) => goPage(el.dataset.page, el.dataset.arg),
   back: () => goBack(),
+  log: (el) => {
+    const id = el.dataset.id;
+    ({ rental: () => rentalDetail(id), repair: () => repairDetail(id), ledger: () => ledgerForm(null, { id }), equipment: () => equipmentForm(id), customer: () => goPage('customer', id) })[el.dataset.target]?.();
+  },
   seg: (el) => { ui.seg[el.dataset.key] = el.dataset.val; render(); },
   more: (el) => { ui.limit[el.dataset.key] = (ui.limit[el.dataset.key] || LIST_STEP) + LIST_STEP; render(); },
   'toggle-lang': () => setLang(lang === 'ar' ? 'ku' : 'ar'),

@@ -1141,6 +1141,219 @@ async function suite() {
     await a.done();
   });
 
+  await test('times: exact moment of every action, activity log, edits, deletes', async () => {
+    const a = await phone();
+    await a.start();
+    const T = await a.T();
+    const at = (hms, day = '2026-11-07') => a.ctx.clock.setFixedTime(new Date(`${day}T${hms}+03:00`));
+    const logged = () => a.js(() => db.log.map((e) => `${e.k} ${new Date(e.at).toTimeString().slice(0, 8)}`));
+    const rowsNow = () => a.p.$$eval('#list .log-row', (rs) => rs.map((r) => [r.querySelector('.log-time').textContent.replace(/\s+/g, ' '), r.querySelector('.log-title').childNodes[0].textContent.trim(), r.querySelector('.chip') ? 'deleted' : r.tagName === 'BUTTON' ? 'opens' : '-']));
+    eq(await a.js(() => [0, 5, 11, 12, 13, 23].map((h) => fmtTime(new Date(2026, 10, 7, h, 4, 9).getTime(), true).replace('\u00A0', ' '))),
+      ['12:04:09 ص', '5:04:09 ص', '11:04:09 ص', '12:04:09 م', '1:04:09 م', '11:04:09 م'], '12-hour clock: midnight, morning, noon, evening');
+    eq(await logged(), [], 'nothing logged before any action');
+
+    // a product at 9:05:07 in the morning
+    await at('09:05:07');
+    await a.page('equipment');
+    await a.addEquipment('خلاطة', 3, 25000);
+    eq(await logged(), ['eq_new 09:05:07'], 'new product logged to the second');
+
+    // two mixers go out at 2:30:15 pm to a new customer
+    await at('14:30:15');
+    await a.tab('rentals');
+    await a.fab();
+    await a.newCustomer('أحمد');
+    await a.pickEquipment(0, 'خلاطة', 2);
+    await a.save();
+    eq((await logged()).slice(1), ['cust_new 14:30:15', 'rent 14:30:15'], 'customer and rental logged');
+    has(await a.text('#list .rc .rc-meta'), '7 تشرين الثاني · 2:30 م', 'open card: the time it went out');
+    await a.p.tap('#list .rc-hit');
+    await a.sheetOpen();
+    let det = await a.text(`${SHEET} .sheet-body`);
+    has(det, `${T.start_date} السبت، 7 تشرين الثاني 2026 · 2:30:15 م`, 'detail: start day and time to the second');
+    hasNot(det, T.recorded_at, 'entered the same day: the start time says it all');
+    hasNot(det, T.edited_at, 'not edited yet');
+    await a.p.tap(`${SHEET} .sheet-head [data-close]`);
+    await a.closed();
+
+    // saving the form unchanged is not an edit; a real change is
+    const rid = await a.js(() => db.rentals[0].id);
+    await at('15:00:00');
+    await a.js((id) => rentalForm(id), rid);
+    await a.sheetOpen();
+    await a.save();
+    eq(await a.js(() => [db.log.length, db.rentals[0].editedAt || 0]), [3, 0], 'unchanged save: no edit recorded');
+    await a.js((id) => rentalForm(id), rid);
+    await a.sheetOpen();
+    await a.set('note', 'موقع العمل');
+    await a.save();
+    eq((await logged()).slice(-1), ['rent_edit 15:00:00'], 'a real edit is logged');
+    await a.p.tap('#list .rc-hit');
+    await a.sheetOpen();
+    has(await a.text(`${SHEET} .sheet-body`), `${T.edited_at} السبت، 7 تشرين الثاني 2026 · 3:00:00 م`, 'detail: last edit');
+    await a.p.tap(`${SHEET} .sheet-head [data-close]`);
+    await a.closed();
+
+    // one mixer comes back at 4:45 pm
+    await at('16:45:00');
+    await a.p.tap('#list [data-act="return"]');
+    await a.sheetOpen();
+    await a.set('ret0', 1);
+    await a.save();
+    eq(await a.js(() => db.rentals.map((r) => [r.items[0].qty, new Date(r.createdAt).toTimeString().slice(0, 8), r.returnedAt ? new Date(r.returnedAt).toTimeString().slice(0, 8) : '-'])),
+      [[1, '14:30:15', '-'], [1, '14:30:15', '16:45:00']], 'the returned part keeps the moment it went out');
+    await a.p.tap('[data-act="seg"][data-val="closed"]');
+    has(await a.text('#list .rc .rc-meta'), '7 تشرين الثاني ← 7 تشرين الثاني · 4:45 م', 'closed card: the time it came back');
+
+    // a repair: received 5:00, ready 5:10:20, delivered 6:00:05
+    await at('17:00:00');
+    await a.tab('repairs');
+    await a.fab();
+    await a.pickCustomer('احمد', 'أحمد');
+    await a.set('device', 'دريل');
+    await a.save();
+    has(await a.text('#list .rc .rc-meta'), '7 تشرين الثاني · 5:00 م', 'repair card: time received');
+    await at('17:10:20');
+    await a.p.tap('#list [data-act="ready"]');
+    await a.clearToast();
+    await at('18:00:05');
+    await a.p.tap('[data-act="seg"][data-val="ready"]');
+    await a.p.tap('#list [data-act="deliver"]');
+    await a.sheetOpen();
+    await a.set('price', 10000);
+    await a.save();
+    await a.p.tap('[data-act="seg"][data-val="delivered"]');
+    has(await a.text('#list .rc .rc-meta'), '7 تشرين الثاني · 6:00 م', 'delivered card: time delivered');
+    await a.p.tap('#list .rc-hit');
+    await a.sheetOpen();
+    det = await a.text(`${SHEET} .sheet-body`);
+    has(det, `${T.date_in} السبت، 7 تشرين الثاني 2026 · 5:00:00 م`, 'detail: received');
+    has(det, `${T.ready_at} السبت، 7 تشرين الثاني 2026 · 5:10:20 م`, 'detail: ready, to the second');
+    has(det, `${T.date_out} السبت، 7 تشرين الثاني 2026 · 6:00:05 م`, 'detail: delivered, to the second');
+    ok(await a.js(() => [...document.querySelectorAll('.ov-sheet:not(.closing) .kv .v')].every((v) => !/\d\s*$/.test(v.innerText.split('\n')[0]) || !/^[صم]/.test(v.innerText.split('\n')[1] || ''))), 'the time never splits from ص/م');
+    await a.p.tap(`${SHEET} .sheet-head [data-close]`);
+    await a.closed();
+
+    // a debt at 7:20 pm and a payment at 7:21:30 pm, then the payment is deleted at 7:25
+    const cid = await a.js(() => db.customers[0].id);
+    await at('19:20:00');
+    await a.js((id) => goPage('customer', id), cid);
+    await a.p.tap('[data-act="new-debt"]');
+    await a.sheetOpen();
+    await a.set('amount', 5000);
+    await a.save();
+    await at('19:21:30');
+    await a.p.tap('[data-act="new-payment"]');
+    await a.sheetOpen();
+    await a.set('amount', 2000);
+    await a.save();
+    const hist = await a.text('#view');
+    has(hist, '7 تشرين الثاني · 7:20 م', 'debt line: its time');
+    has(hist, '7 تشرين الثاني · 7:21 م', 'payment line: its time');
+    await at('19:25:00');
+    await a.p.tap('#view .rc:has(.hist-ic.pay) .rc-hit');
+    await a.sheetOpen();
+    has(await a.text(`${SHEET} .rec-hint`), `${T.recorded_at}: السبت، 7 تشرين الثاني 2026 · 7:21:30 م`, 'edit form: when it was recorded');
+    await a.p.tap(`${SHEET} [data-del]`);
+    await a.dialogOpen();
+    await a.p.tap(`${DIALOG} [data-yes]`);
+    await a.closed();
+
+    // the activity page: newest first, each to the second
+    await a.page('activity');
+    eq(await a.texts('.day-head'), [`${T.today} · السبت، 7 تشرين الثاني 2026`], 'one day, called today');
+    eq(await rowsNow(), [
+      ['7:25:00 م', T.log_pay_del, '-'],
+      ['7:21:30 م', T.record_payment, 'deleted'],
+      ['7:20:00 م', T.add_debt, 'opens'],
+      ['6:00:05 م', T.deliver_title, 'opens'],
+      ['5:10:20 م', T.marked_ready, 'opens'],
+      ['5:00:00 م', T.new_repair, 'opens'],
+      ['4:45:00 م', T.log_return_part, 'opens'],
+      ['3:00:00 م', T.edit_rental, 'opens'],
+      ['2:30:15 م', T.new_rental, 'opens'],
+      ['2:30:15 م', T.new_customer, 'opens'],
+      ['9:05:07 ص', T.new_equipment, 'opens'],
+    ], 'every action, newest first');
+    const rows = await a.texts('#list .log-row');
+    has(rows[0], `${T.log_pay_del} 2,000 ${T.currency} أحمد`, 'deleted payment: how much and whose');
+    has(rows[6], `أحمد · خلاطة ×1`, 'partial return: what came back');
+    has(rows[6], `${T.paid} `, 'partial return: what was paid');
+    has(rows[8], `أحمد · خلاطة ×2`, 'rental: what went out');
+    await a.p.tap('[data-act="seg"][data-val="repairs"]');
+    eq((await rowsNow()).map((r) => r[1]), [T.deliver_title, T.marked_ready, T.new_repair], 'repairs only');
+    await a.p.tap('[data-act="seg"][data-val="money"]');
+    eq((await rowsNow()).map((r) => r[1]), [T.log_pay_del, T.record_payment, T.add_debt], 'money only');
+    await a.p.tap('[data-act="seg"][data-val="all"]');
+    await a.p.fill('[data-search="activity"]', 'دريل');
+    await a.p.waitForTimeout(250);
+    eq((await rowsNow()).map((r) => r[1]), [T.deliver_title, T.marked_ready, T.new_repair], 'search by what');
+    await a.p.fill('[data-search="activity"]', '');
+    await a.p.waitForTimeout(250);
+    await a.p.tap('#list .log-row[data-target="rental"]');
+    await a.sheetOpen();
+    has(await a.text(`${SHEET} .sheet-body`), `${T.return_date} السبت، 7 تشرين الثاني 2026 · 4:45:00 م`, 'tapping a row opens that record');
+    await a.p.tap(`${SHEET} .sheet-head [data-close]`);
+    await a.closed();
+
+    // home shows the last five under their day
+    await a.tab('home');
+    await a.p.waitForFunction(() => location.hash === '#/home' && !!document.querySelector('#view .log-row'));
+    has(await a.text('#view'), T.recent_activity, 'home: recent actions');
+    eq(await a.p.$$eval('#view .log-row', (x) => x.length), 5, 'home: five of them');
+
+    // the next morning they are yesterday's
+    await at('08:00:00', '2026-11-08');
+    await a.p.reload();
+    await a.p.waitForSelector('.nav a');
+    await a.page('activity');
+    eq(await a.texts('.day-head'), [`${T.yesterday} · السبت، 7 تشرين الثاني 2026`], 'yesterday');
+    await a.tab('rentals');
+    await a.p.tap('[data-act="seg"][data-val="open"]');
+    has(await a.text('#list .rc .rc-meta'), '7 تشرين الثاني · 2:30 م', 'the time stays on the card the next day');
+
+    // Kurdish: same moments in Kurdish words
+    await a.js(() => setLang('ku'));
+    const K = await a.T('ku');
+    await a.page('activity');
+    eq((await rowsNow())[0], ['7:25:00 د.ن', K.log_pay_del, '-'], 'Kurdish clock words and titles');
+    eq((await rowsNow())[10], ['9:05:07 ب.ن', K.new_equipment, 'opens'], 'Kurdish morning');
+    ok((await a.texts('.day-head'))[0].startsWith(`${K.yesterday} · `), 'Kurdish yesterday');
+    eq(await a.js(() => [logWhat({ k: 'eq_new' }), logWhat({ k: 'rent', i: [['', 2]] })]), [K.no_name, `${K.no_name} ×2`], 'a missing name reads in the language in use');
+    await a.js(() => setLang('ar'));
+
+    // a rental entered today for a day that already passed: no time on the card, the moment it was entered in the detail
+    await at('08:05:00', '2026-11-08');
+    await a.tab('rentals');
+    await a.fab();
+    await a.pickCustomer('احمد', 'أحمد');
+    await a.pickEquipment(0, 'خلاطة', 1);
+    await a.set('start', '2026-11-06');
+    await a.save();
+    const late = await a.texts('#list .rc .rc-meta');
+    ok(late.some((x) => x.includes('6 تشرين الثاني') && !x.includes(':')), 'back-dated card: day only', J(late));
+    await a.p.tap('#list .rc:has-text("6 تشرين الثاني") .rc-hit');
+    await a.sheetOpen();
+    det = await a.text(`${SHEET} .sheet-body`);
+    has(det, `${T.start_date} الجمعة، 6 تشرين الثاني 2026 ${T.days_count}`, 'back-dated: the start day has no time');
+    has(det, `${T.recorded_at} الأحد، 8 تشرين الثاني 2026 · 8:05:00 ص`, 'back-dated: when it was really entered');
+    await a.p.tap(`${SHEET} .sheet-head [data-close]`);
+    await a.closed();
+
+    // limits and old data
+    eq(await a.js(() => {
+      const keep = db.log;
+      db.log = [];
+      for (let i = 0; i < LOG_MAX + 5; i++) logAction('backup', { n: String(i) });
+      const out = [db.log.length, db.log[0].n, db.log[db.log.length - 1].n];
+      db.log = keep;
+      return out;
+    }), [20000, '5', '20004'], 'the oldest actions drop off after 20,000');
+    eq(await a.js(() => normalizeDb({ equipment: [], customers: [], rentals: [], repairs: [], ledger: [] }).log), [], 'a backup from before this version restores with an empty log');
+    eq(await a.js(() => JSON.parse(backupText()).data.log.length === db.log.length), true, 'backups carry the log');
+    await a.done();
+  });
+
   await test('reports: every number matches the hand calculation', async () => {
     const a = await phone();
     await a.start();
@@ -1350,6 +1563,8 @@ async function suite() {
     const parsed = JSON.parse(text);
     eq([parsed.app, parsed.data.rentals.length, parsed.data.repairs.length, parsed.data.ledger.length, parsed.data.customers.length, parsed.data.equipment.length], ['daftar-mahal', 6, 4, 2, 2, 2], 'file holds everything');
     eq(await a.toast(), T.backup_ready, 'toast');
+    ok(Array.isArray(parsed.data.log), 'file holds the activity log');
+    eq(await a.js(() => db.log[db.log.length - 1].k), 'backup', 'the backup itself is logged');
     has(await a.text('#view'), T.last_backup.replace('{d}', '7 تشرين الثاني'), 'last backup date');
     // Google Drive path: the phone's share sheet receives a .txt file (Chrome refuses .json)
     await a.js(() => {
@@ -1394,6 +1609,7 @@ async function suite() {
     await a.p.waitForFunction(() => db.rentals.length === 6);
     const same = await a.js((orig) => { const o = JSON.parse(orig).data; return ['equipment', 'customers', 'rentals', 'repairs', 'ledger'].every((k) => JSON.stringify(db[k]) === JSON.stringify(o[k])); }, text);
     ok(same, 'restored data identical to the backup');
+    eq(await a.js((n) => [db.log.length - n, db.log[db.log.length - 1].k], JSON.parse(text).data.log.length), [1, 'restore'], 'the log comes back too, plus the restore itself');
     await a.p.reload();
     await a.p.waitForSelector('.nav a');
     eq(await a.js(() => balances().get('c2')), 70000, 'restore survives restart');
@@ -1416,6 +1632,7 @@ async function suite() {
     await a.closed();
     await a.p.waitForFunction(() => location.hash === '#/home');
     eq(await a.js(() => [db.rentals.length, db.customers.length, db.equipment.length, db.settings.shopName, db.settings.lang]), [0, 0, 0, 'هريم', 'ar'], 'wiped, keeps language and name');
+    eq(await a.js(() => db.log.map((e) => e.k)), ['wipe'], 'only the wipe itself stays in the log');
     await a.p.reload();
     await a.p.waitForSelector('.nav a');
     eq(await a.js(() => db.rentals.length), 0, 'stays wiped');
@@ -1766,6 +1983,8 @@ async function suite() {
       db.rentals = Array.from({ length: 8000 }, (_, i) => ({ id: `r${i}`, customerId: `c${i % 1500}`, items: [{ equipmentId: `e${i % 60}`, name: `معدة ${i % 60}`, qty: 1 + (i % 5), rate: 1000 }], start: date(i), advance: 0, note: '', returnDate: i < 40 ? null : date(i), days: 3, total: 3000, paidAtReturn: 2000, createdAt: i, updatedAt: i }));
       db.repairs = Array.from({ length: 4000 }, (_, i) => ({ id: `p${i}`, customerId: `c${i % 1500}`, device: `آلة ${i}`, problem: '', dateIn: date(i), dateOut: date(i), price: 5000, parts: 1000, paid: 4000, status: 'delivered', note: '', createdAt: i, updatedAt: i }));
       db.ledger = Array.from({ length: 3000 }, (_, i) => ({ id: `l${i}`, customerId: `c${i % 1500}`, type: i % 2 ? 'pay' : 'debt', amount: 500, date: date(i), note: '', createdAt: i }));
+      const kinds = ['rent', 'return', 'pay', 'debt', 'repair', 'deliver'];
+      db.log = Array.from({ length: LOG_MAX }, (_, i) => ({ at: Date.parse('2024-01-01T08:00:00+03:00') + i * 3600e3, k: kinds[i % 6], r: `${'rrllpp'[i % 6]}${i % 3000}`, c: `c${i % 1500}`, cn: `زبون رقم ${i % 1500}`, ...(i % 6 < 2 ? { i: [[`معدة ${i % 60}`, 1 + (i % 5)]] } : { x: `آلة ${i}` }), a: 500 * (i % 40) }));
       commit();
     });
     await a.p.waitForTimeout(800);
@@ -1782,6 +2001,8 @@ async function suite() {
     times.equipment = await timed("goPage('equipment')");
     times.reports = await timed("goPage('reports')");
     times.customerPage = await timed("goPage('customer','c7')");
+    times.activity = await timed("goPage('activity')");
+    times.activitySearch = await timed("ui.q.activity='زبون رقم 77'; document.querySelector('#list').innerHTML = listActivity(); ui.q.activity=''");
     times.search = await timed("goTab('rentals'); ui.q.rentals='زبون رقم 77'; document.querySelector('#list').innerHTML = listRentals(); ui.q.rentals=''");
     times.saveMs = await a.js(async () => { const t0 = performance.now(); db.settings.lastBackup = null; await writeDb(); return Math.round(performance.now() - t0); });
     console.log(`        times on a 4x slower CPU (ms): ${J(times)}`);
@@ -2125,6 +2346,30 @@ function seedRich(R) {
     { id: 'l2', customerId: 'c2', type: 'debt', amount: 125000000, date: '2026-05-15', note: 'بقية حساب قديم', createdAt: 1 },
     { id: 'l3', customerId: 'c4', type: 'pay', amount: 75000, date: '2026-11-01', note: '', createdAt: 1 },
   ];
+  // exact moments: some records were entered on their own day (the time shows), the rest were back-dated
+  const at = (x) => Date.parse(`${x}+03:00`);
+  Object.assign(db.rentals[1], { createdAt: at('2026-11-06T16:42:10') });
+  Object.assign(db.rentals[2], { returnedAt: at('2026-11-05T13:05:00'), editedAt: at('2026-11-06T08:01:30') });
+  Object.assign(db.repairs[1], { createdAt: at('2026-11-05T09:15:00'), readyAt: at('2026-11-06T17:20:05') });
+  Object.assign(db.repairs[2], { deliveredAt: at('2026-11-03T12:00:59') });
+  Object.assign(db.ledger[0], { createdAt: at('2026-11-04T18:30:45') });
+  const items = (x) => x.items.map((i) => [i.name, i.qty]);
+  const L = (x, k, more = {}) => ({ at: at(x), k, ...more });
+  db.log = [
+    L('2026-11-03T12:00:59', 'deliver', { r: 'p3', c: 'c1', cn: R.long, x: `خلاطة صغيرة · ${R.prob}`, a: 3500000, p: 2000000 }),
+    L('2026-11-04T18:30:45', 'pay', { r: 'l1', t: 'pay', c: 'c1', cn: R.long, n: R.note, a: 1500000 }),
+    L('2026-11-05T09:15:00', 'repair', { r: 'p2', c: 'c2', cn: R.kurd, x: 'دريل هلتي · السويج عاطل' }),
+    L('2026-11-05T13:05:00', 'return', { r: 'r3', c: 'c1', cn: R.long, i: items(db.rentals[2]), a: 24500000, p: 10000000 }),
+    L('2026-11-06T08:01:30', 'rent_edit', { r: 'r3', c: 'c1', cn: R.long, i: items(db.rentals[2]) }),
+    L('2026-11-06T16:42:10', 'rent', { r: 'r2', c: 'c2', cn: R.kurd, i: items(db.rentals[1]) }),
+    L('2026-11-06T17:20:05', 'ready', { r: 'p2', c: 'c2', cn: R.kurd, x: 'دريل هلتي · السويج عاطل' }),
+    L('2026-11-07T00:00:01', 'rent', { r: 'gone', c: 'gone', cn: 'علي', i: [['', 2], ['سقالة حديد', 240]], p: 2500000 }),
+    L('2026-11-07T00:10:00', 'rent_del', { c: 'gone', cn: 'علي', i: [['', 2], ['سقالة حديد', 240]] }),
+    L('2026-11-07T08:59:59', 'eq_new', { r: 'e5' }),
+    L('2026-11-07T09:30:00', 'ledger_del', { t: 'debt', c: 'c4', cn: 'سامي', a: 125000000 }),
+    L('2026-11-07T09:45:12', 'cust_del', { c: 'gone2', cn: R.long }),
+    L('2026-11-07T09:58:01', 'backup'),
+  ];
   commit();
 }
 // runs in the page: looks at the top-most layer and reports anything a person would call broken
@@ -2166,7 +2411,7 @@ function auditPage() {
         else if (el.matches('input:not([data-money]), textarea')) { /* long text scrolls inside a field */ }
         else add('CLIPPED', el, `${el.scrollWidth}>${el.clientWidth}: ${(el.innerText || '').slice(0, 24)}`);
       }
-      if (clips && cs.overflowY !== 'visible' && el.scrollHeight > el.clientHeight + 2 && el.clientHeight > 0 && !el.matches('.card, .hero, .sheet, .sheet-body, .menu-card, .stepper, .rc-sub, .rc-title > span, .ep-name, textarea') && !el.closest('.sheet-body.scroll')) add('v-clipped', el, `${el.scrollHeight}>${el.clientHeight}`);
+      if (clips && cs.overflowY !== 'visible' && el.scrollHeight > el.clientHeight + 2 && el.clientHeight > 0 && !el.matches('.card, .hero, .sheet, .sheet-body, .menu-card, .stepper, .rc-sub, .log-sub, .rc-title > span, .ep-name, textarea') && !el.closest('.sheet-body.scroll')) add('v-clipped', el, `${el.scrollHeight}>${el.clientHeight}`);
       // text sticking out of its button, chip, tile or column
       const direct = [...el.childNodes].filter((n) => n.nodeType === 3 && n.textContent.trim());
       if (direct.length && cs.textOverflow !== 'ellipsis' && !el.matches('textarea, input, select')) {
@@ -2217,6 +2462,10 @@ const STATES = [
   ['reports-numbers', (a) => a.js(() => { goPage('reports'); document.querySelector('.big-stat').scrollIntoView(); window.scrollBy(0, -80); })],
   ['reports-bottom', (a) => a.js(() => { goPage('reports'); window.scrollTo(0, 99999); })],
   ['settings', (a) => a.js(() => goPage('settings'))],
+  ['home-activity', (a) => a.js(async () => { goTab('home'); await new Promise((r) => setTimeout(r, 80)); window.scrollTo(0, 99999); })],
+  ['activity', (a) => a.js(() => { ui.seg.activity = 'all'; goPage('activity'); })],
+  ['activity-bottom', (a) => a.js(() => { ui.seg.activity = 'all'; goPage('activity'); window.scrollTo(0, 99999); })],
+  ['activity-money', (a) => a.js(() => { ui.seg.activity = 'money'; goPage('activity'); })],
   ['settings-bottom', (a) => a.js(() => { goPage('settings'); window.scrollTo(0, 99999); })],
   ['rental-new', (a) => a.js(async () => {
     const wait = () => new Promise((r) => setTimeout(r, 80));
@@ -2272,6 +2521,7 @@ const EMPTY_STATES = [
   ['empty-customers', (a) => a.js(() => goPage('customers'))],
   ['empty-equipment', (a) => a.js(() => { db.equipment = []; goPage('equipment'); })],
   ['empty-reports', (a) => a.js(() => { db.equipment = []; goPage('reports'); })],
+  ['empty-activity', (a) => a.js(() => { db.log = []; goPage('activity'); })],
 ];
 const NO_ANIM = '*,*::before,*::after{transition:none!important;animation:none!important}';
 async function auditCombo(width, height, lang, scheme, shoot, engine = 'chromium', device = 'Pixel 7') {

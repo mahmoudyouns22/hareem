@@ -1,5 +1,5 @@
 /* Offline support. Bump VERSION on every release so phones pick up the new files. */
-const VERSION = '1.0.3';
+const VERSION = '1.0.4';
 const APP_CACHE = `hareem-app-${VERSION}`;
 const ASSETS = [
   './',
